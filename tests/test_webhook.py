@@ -1,6 +1,11 @@
 import unittest
 
-from gate_bridge.webhook import is_allowed_caller, normalize_phone, twiml_say
+from gate_bridge.webhook import (
+    is_allowed_caller,
+    normalize_phone,
+    twiml_gather,
+    twiml_say,
+)
 
 
 class WebhookHelpersTests(unittest.TestCase):
@@ -20,6 +25,14 @@ class WebhookHelpersTests(unittest.TestCase):
         output = twiml_say("The gate is now open.").decode("utf-8")
         self.assertIn("<Say>The gate is now open.</Say>", output)
         self.assertIn("<Hangup/>", output)
+
+    def test_twiml_gather_output(self):
+        output = twiml_gather("Press 1 now to open the gate.", "/twilio/voice/confirm")
+        rendered = output.decode("utf-8")
+        self.assertIn("<Gather", rendered)
+        self.assertIn('numDigits="1"', rendered)
+        self.assertIn('action="/twilio/voice/confirm"', rendered)
+        self.assertIn("<Say>Press 1 now to open the gate.</Say>", rendered)
 
 
 if __name__ == "__main__":

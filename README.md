@@ -6,9 +6,11 @@ Phone-call to UniFi Access gate unlock bridge.
 
 - Twilio sends inbound call webhooks to `/twilio/voice`.
 - Service checks caller ID against `ALLOWED_CALLERS`.
-- If allowed, it resolves door by name (default `Gate`) and unlocks through UniFi Access API.
+- If allowed, caller must press `1` (DTMF) to open.
+- Only when digit `1` is received on `/twilio/voice/confirm`, it resolves door by name (default `Gate`) and unlocks through UniFi Access API.
 - It answers the call with TwiML:
-  - Allowed: "The gate is now open."
+  - Step 1 (allowed): "Press 1 now to open the gate."
+  - Step 2 (allowed + pressed 1): "The gate is now open."
   - Blocked: "This incoming number is not authorized for this gate."
 
 ## Project commands
@@ -80,7 +82,7 @@ In Twilio Console for your number:
 - Method: `HTTP POST`
 3. Save.
 
-Optional: if you want extra control, use a TwiML Bin that redirects to the same URL, but webhook direct is simplest.
+No Twilio Function/Studio flow is required.
 
 ## Cloudflare tunnel configuration
 
@@ -162,7 +164,18 @@ curl -sS -X POST "https://gate.example.com/twilio/voice" \
   --data-urlencode "CallSid=TEST123"
 ```
 
-3. Call Twilio number from an allowed caller. You should hear: "The gate is now open."
+Expected response contains a `<Gather ... action="/twilio/voice/confirm">`.
+
+3. Simulate pressing 1:
+
+```bash
+curl -sS -X POST "https://gate.example.com/twilio/voice/confirm" \
+  --data-urlencode "From=+17075551111" \
+  --data-urlencode "CallSid=TEST123" \
+  --data-urlencode "Digits=1"
+```
+
+4. Call Twilio number from an allowed caller. You should hear prompt, press `1`, then hear: "The gate is now open."
 
 ## Tests
 

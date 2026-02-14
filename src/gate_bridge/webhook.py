@@ -4,7 +4,7 @@ import os
 import xml.sax.saxutils as saxutils
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from gate_bridge.client import AccessApiError, AccessClient
 
@@ -50,6 +50,21 @@ def twiml_say(message: str) -> bytes:
     ).encode("utf-8")
 
 
+def twiml_gather(prompt: str, action: str) -> bytes:
+    safe_prompt = saxutils.escape(prompt)
+    safe_action = saxutils.escape(action)
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Response>"
+        f"<Gather input=\"dtmf\" numDigits=\"1\" action=\"{safe_action}\" method=\"POST\" timeout=\"5\">"
+        f"<Say>{safe_prompt}</Say>"
+        "</Gather>"
+        "<Say>No input received. Goodbye.</Say>"
+        "<Hangup/>"
+        "</Response>"
+    ).encode("utf-8")
+
+
 def load_config_from_env() -> WebhookConfig:
     host = os.getenv("UNIFI_HOST")
     token = os.getenv("UNIFI_ACCESS_API_TOKEN")
@@ -88,7 +103,8 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
     config: WebhookConfig
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/twilio/voice":
+        path = urlparse(self.path).path
+        if path not in {"/twilio/voice", "/twilio/voice/confirm"}:
             self._send_response(404, twiml_say("Not found."))
             return
 
@@ -103,6 +119,21 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
                 200,
                 twiml_say("This incoming number is not authorized for this gate."),
             )
+            return
+
+        if path == "/twilio/voice":
+            self._send_response(
+                200,
+                twiml_gather(
+                    "Press 1 now to open the gate.",
+                    "/twilio/voice/confirm",
+                ),
+            )
+            return
+
+        digit = form.get("Digits", [""])[0].strip()
+        if digit != "1":
+            self._send_response(200, twiml_say("Invalid selection. Goodbye."))
             return
 
         client = AccessClient(
@@ -123,6 +154,7 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
                     "source": "twilio-voice",
                     "from": from_number,
                     "call_sid": call_sid,
+                    "digit": digit,
                 },
             )
             self._send_response(200, twiml_say("The gate is now open."))
