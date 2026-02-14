@@ -14,6 +14,7 @@ authors = [
 
 [project.scripts]
 gate-open = "gate_bridge.cli:main"
+gate-webhook = "gate_bridge.webhook_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

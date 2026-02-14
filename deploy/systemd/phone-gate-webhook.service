@@ -1,0 +1,22 @@
+[Unit]
+Description=Phone Gate Bridge Twilio Webhook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gatebridge
+Group=gatebridge
+WorkingDirectory=/opt/phone-gate-bridge
+EnvironmentFile=/etc/phone-gate-bridge/phone-gate-bridge.env
+ExecStart=/opt/phone-gate-bridge/.venv/bin/gate-webhook
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/phone-gate-bridge
+
+[Install]
+WantedBy=multi-user.target
