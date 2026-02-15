@@ -32,6 +32,7 @@ class WebhookConfig:
     allowed_callers_file: str = "/etc/phone-gate-bridge/allowed-callers.toml"
     twilio_auth_token: str = ""
     public_base_url: str = ""
+    twilio_tts_voice: str = "Polly.Joanna-Neural"
 
 
 @dataclass(frozen=True)
@@ -125,27 +126,31 @@ def find_allowed_caller(
     return None
 
 
-def twiml_say(message: str) -> bytes:
+def twiml_say(message: str, voice: str = "Polly.Joanna-Neural") -> bytes:
     safe = saxutils.escape(message)
+    safe_voice = saxutils.escape(voice)
     return (
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
         "<Response>"
-        f"<Say>{safe}</Say>"
+        f"<Say voice=\"{safe_voice}\">{safe}</Say>"
         "<Hangup/>"
         "</Response>"
     ).encode("utf-8")
 
 
-def twiml_gather(prompt: str, action: str) -> bytes:
+def twiml_gather(
+    prompt: str, action: str, voice: str = "Polly.Joanna-Neural"
+) -> bytes:
     safe_prompt = saxutils.escape(prompt)
     safe_action = saxutils.escape(action)
+    safe_voice = saxutils.escape(voice)
     return (
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
         "<Response>"
         f"<Gather input=\"dtmf\" numDigits=\"1\" action=\"{safe_action}\" method=\"POST\" timeout=\"5\">"
-        f"<Say>{safe_prompt}</Say>"
+        f"<Say voice=\"{safe_voice}\">{safe_prompt}</Say>"
         "</Gather>"
-        "<Say>No input received. Goodbye.</Say>"
+        f"<Say voice=\"{safe_voice}\">No input received. Goodbye.</Say>"
         "<Hangup/>"
         "</Response>"
     ).encode("utf-8")
@@ -213,6 +218,7 @@ def load_config_from_env() -> WebhookConfig:
         allowed_callers_file=allowed_callers_file,
         twilio_auth_token=twilio_auth_token,
         public_base_url=public_base_url.rstrip("/"),
+        twilio_tts_voice=os.getenv("TWILIO_TTS_VOICE", "Polly.Joanna-Neural"),
     )
 
 
@@ -222,7 +228,7 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path not in {"/twilio/voice", "/twilio/voice/confirm"}:
-            self._send_response(404, twiml_say("Not found."))
+            self._send_response(404, twiml_say("Not found.", self.config.twilio_tts_voice))
             return
 
         length = int(self.headers.get("Content-Length", "0"))
@@ -246,7 +252,10 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             self._send_response(
                 200,
-                twiml_say("Unable to verify access right now. Please try again."),
+                twiml_say(
+                    "Unable to verify access right now. Please try again.",
+                    self.config.twilio_tts_voice,
+                ),
             )
             return
         allowed_caller = find_allowed_caller(from_number, allowed_callers)
@@ -254,7 +263,10 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
         if allowed_caller is None:
             self._send_response(
                 200,
-                twiml_say("This incoming number is not authorized for this gate."),
+                twiml_say(
+                    "This incoming number is not authorized for this gate.",
+                    self.config.twilio_tts_voice,
+                ),
             )
             return
 
@@ -264,13 +276,17 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
                 twiml_gather(
                     "Press 1 now to open the gate.",
                     "/twilio/voice/confirm",
+                    self.config.twilio_tts_voice,
                 ),
             )
             return
 
         digit = form.get("Digits", [""])[0].strip()
         if digit != "1":
-            self._send_response(200, twiml_say("Invalid selection. Goodbye."))
+            self._send_response(
+                200,
+                twiml_say("Invalid selection. Goodbye.", self.config.twilio_tts_voice),
+            )
             return
 
         client = AccessClient(
@@ -295,11 +311,17 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
                     "caller_name": allowed_caller.name,
                 },
             )
-            self._send_response(200, twiml_say("The gate is now open."))
+            self._send_response(
+                200,
+                twiml_say("The gate is now open.", self.config.twilio_tts_voice),
+            )
         except (AccessApiError, ValueError):
             self._send_response(
                 200,
-                twiml_say("Unable to open the gate right now. Please try again."),
+                twiml_say(
+                    "Unable to open the gate right now. Please try again.",
+                    self.config.twilio_tts_voice,
+                ),
             )
 
     def do_GET(self) -> None:  # noqa: N802

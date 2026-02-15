@@ -71,6 +71,7 @@ Required values:
 - `UNIFI_ACCESS_API_TOKEN`
 - `PUBLIC_BASE_URL` (example: `https://gate.teich.network`)
 - `TWILIO_AUTH_TOKEN` (from Twilio Console)
+- `TWILIO_TTS_VOICE` (optional, default: `Polly.Joanna-Neural`)
 - `ALLOWED_CALLERS_FILE` (example: `/etc/phone-gate-bridge/allowed-callers.toml`)
 
 Caller allowlist file:
@@ -119,6 +120,7 @@ Security note:
 
 - Incoming webhook requests are validated with `X-Twilio-Signature`.
 - `PUBLIC_BASE_URL` must exactly match the external URL Twilio calls.
+- Voice quality can be improved by setting `TWILIO_TTS_VOICE` (for example `Polly.Joanna-Neural` or another Twilio-supported voice).
 
 ## Cloudflare tunnel configuration
 

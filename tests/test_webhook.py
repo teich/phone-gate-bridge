@@ -61,7 +61,7 @@ class WebhookHelpersTests(unittest.TestCase):
 
     def test_twiml_output(self):
         output = twiml_say("The gate is now open.").decode("utf-8")
-        self.assertIn("<Say>The gate is now open.</Say>", output)
+        self.assertIn('<Say voice="Polly.Joanna-Neural">The gate is now open.</Say>', output)
         self.assertIn("<Hangup/>", output)
 
     def test_twiml_gather_output(self):
@@ -70,7 +70,10 @@ class WebhookHelpersTests(unittest.TestCase):
         self.assertIn("<Gather", rendered)
         self.assertIn('numDigits="1"', rendered)
         self.assertIn('action="/twilio/voice/confirm"', rendered)
-        self.assertIn("<Say>Press 1 now to open the gate.</Say>", rendered)
+        self.assertIn(
+            '<Say voice="Polly.Joanna-Neural">Press 1 now to open the gate.</Say>',
+            rendered,
+        )
 
     def test_twilio_signature_valid(self):
         url = "https://gate.teich.network/twilio/voice"
