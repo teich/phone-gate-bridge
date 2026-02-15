@@ -58,7 +58,12 @@ curl -sS http://127.0.0.1:8080/healthz
 
 ## Environment file
 
-Start from `.env.example` and copy values into your real `.env`.
+Use two env files:
+
+- Local/dev: `/opt/phone-gate-bridge/.env`
+- systemd runtime: `/etc/phone-gate-bridge/phone-gate-bridge.env`
+
+Start from `.env.example` and create your local `.env`.
 
 Required values:
 
@@ -72,6 +77,17 @@ Important:
 
 - Keep `.env` out of git.
 - If your UDM cert is self-signed, set `UNIFI_INSECURE_TLS=true`.
+- After any `.env` change, sync it to the systemd env file:
+
+```bash
+sudo install -m 640 -o root -g gatebridge /opt/phone-gate-bridge/.env /etc/phone-gate-bridge/phone-gate-bridge.env
+```
+
+- Validate runtime env file before restart:
+
+```bash
+sudo /opt/phone-gate-bridge/deploy/validate-env.sh /etc/phone-gate-bridge/phone-gate-bridge.env
+```
 
 ## Twilio configuration
 
@@ -129,13 +145,44 @@ sudoedit /etc/cloudflared/phone-gate.yml
 
 ### 1) App service
 
+First-time server bootstrap (git clone + venv):
+
+```bash
+sudo useradd --system --home /opt/phone-gate-bridge --shell /usr/sbin/nologin gatebridge || true
+sudo mkdir -p /opt/phone-gate-bridge /etc/phone-gate-bridge
+sudo chown -R gatebridge:gatebridge /opt/phone-gate-bridge
+sudo -u gatebridge git clone <YOUR_GITHUB_REPO_URL> /opt/phone-gate-bridge
+sudo -u gatebridge python3 -m venv /opt/phone-gate-bridge/.venv
+sudo -u gatebridge /opt/phone-gate-bridge/.venv/bin/pip install -e /opt/phone-gate-bridge
+sudo install -m 640 -o root -g gatebridge /opt/phone-gate-bridge/.env /etc/phone-gate-bridge/phone-gate-bridge.env
+sudo chown root:gatebridge /etc/phone-gate-bridge/phone-gate-bridge.env
+sudo chmod 640 /etc/phone-gate-bridge/phone-gate-bridge.env
+sudo cp /opt/phone-gate-bridge/deploy/systemd/phone-gate-webhook.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now phone-gate-webhook.service
+```
+
+Update deploys (recommended):
+
+```bash
+sudo /opt/phone-gate-bridge/deploy/deploy-phone-gate.sh
+```
+
+Optional variables for deploy script:
+
+```bash
+sudo APP_DIR=/opt/phone-gate-bridge APP_USER=gatebridge BRANCH=main SERVICE_NAME=phone-gate-webhook.service ENV_FILE=/etc/phone-gate-bridge/phone-gate-bridge.env /opt/phone-gate-bridge/deploy/deploy-phone-gate.sh
+```
+
+Legacy/manual approach:
+
 ```bash
 sudo useradd --system --home /opt/phone-gate-bridge --shell /usr/sbin/nologin gatebridge || true
 sudo mkdir -p /opt/phone-gate-bridge /etc/phone-gate-bridge
 sudo rsync -a --delete ./ /opt/phone-gate-bridge/
-python3 -m venv /opt/phone-gate-bridge/.venv
-sudo /opt/phone-gate-bridge/.venv/bin/pip install -e /opt/phone-gate-bridge
-sudo cp .env /etc/phone-gate-bridge/phone-gate-bridge.env
+sudo -u gatebridge python3 -m venv /opt/phone-gate-bridge/.venv
+sudo -u gatebridge /opt/phone-gate-bridge/.venv/bin/pip install -e /opt/phone-gate-bridge
+sudo install -m 640 -o root -g gatebridge .env /etc/phone-gate-bridge/phone-gate-bridge.env
 sudo chown -R gatebridge:gatebridge /opt/phone-gate-bridge
 sudo chown root:gatebridge /etc/phone-gate-bridge/phone-gate-bridge.env
 sudo chmod 640 /etc/phone-gate-bridge/phone-gate-bridge.env
