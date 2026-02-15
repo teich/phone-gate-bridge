@@ -56,6 +56,12 @@ Health check:
 curl -sS http://127.0.0.1:8080/healthz
 ```
 
+Dashboard (local networks only):
+
+```bash
+curl -sS http://127.0.0.1:8080/dashboard
+```
+
 ## Environment file
 
 Use two env files:
@@ -73,6 +79,9 @@ Required values:
 - `TWILIO_AUTH_TOKEN` (from Twilio Console)
 - `TWILIO_TTS_VOICE` (optional, default: `Polly.Joanna-Neural`)
 - `ALLOWED_CALLERS_FILE` (example: `/etc/phone-gate-bridge/allowed-callers.toml`)
+- `DASHBOARD_ALLOWED_CIDRS` (optional, default: `127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`)
+- `DASHBOARD_RECENT_EVENTS_LIMIT` (optional, default: `100`)
+- `DASHBOARD_DB_PATH` (optional, default: `var/activity.sqlite3`)
 
 Caller allowlist file:
 
@@ -121,6 +130,8 @@ Security note:
 - Incoming webhook requests are validated with `X-Twilio-Signature`.
 - `PUBLIC_BASE_URL` must exactly match the external URL Twilio calls.
 - Voice quality can be improved by setting `TWILIO_TTS_VOICE` (for example `Polly.Joanna-Neural` or another Twilio-supported voice).
+- Dashboard requests are only served when source IP matches `DASHBOARD_ALLOWED_CIDRS`.
+- Dashboard activity persists in SQLite at `DASHBOARD_DB_PATH` and survives service restarts.
 
 ## Cloudflare tunnel configuration
 
@@ -153,8 +164,13 @@ sudo cp deploy/cloudflared/phone-gate.yml /etc/cloudflared/phone-gate.yml
 sudoedit /etc/cloudflared/phone-gate.yml
 ```
 
-6. Ensure ingress points to local webhook:
-- `service: http://127.0.0.1:8080`
+6. Keep public ingress scoped to Twilio paths:
+- `/twilio/*` should route to `http://127.0.0.1:8080`.
+- Do not expose `/dashboard` in tunnel ingress.
+
+7. If you want to view dashboard from another LAN host, bind webhook to LAN:
+- Set `WEBHOOK_BIND_HOST=0.0.0.0`.
+- Restrict access with firewall rules and `DASHBOARD_ALLOWED_CIDRS`.
 
 ## systemd services (Debian 13)
 

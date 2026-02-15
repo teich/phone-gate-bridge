@@ -3,12 +3,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from gate_bridge.webhook import (
+    ActivityEvent,
+    ActivityStore,
     AllowedCaller,
+    build_dashboard_html,
     build_twilio_signature,
     find_allowed_caller,
+    is_ip_allowed,
     is_valid_twilio_signature,
     load_allowed_callers,
     normalize_phone,
+    parse_cidr_list,
     twiml_gather,
     twiml_say,
 )
@@ -106,6 +111,55 @@ class WebhookHelpersTests(unittest.TestCase):
                 auth_token="auth-token",
             )
         )
+
+    def test_parse_cidr_list_and_ip_allowed(self):
+        networks = parse_cidr_list("127.0.0.1/32, 192.168.0.0/16")
+        self.assertTrue(is_ip_allowed("127.0.0.1", networks))
+        self.assertTrue(is_ip_allowed("192.168.2.25", networks))
+        self.assertFalse(is_ip_allowed("8.8.8.8", networks))
+
+    def test_parse_cidr_list_rejects_invalid(self):
+        with self.assertRaises(ValueError):
+            parse_cidr_list("192.168.0.0/16,not-a-cidr")
+
+    def test_dashboard_html_contains_metrics(self):
+        rendered = build_dashboard_html(
+            counts={
+                "unlock_success": 3,
+                "caller_blocked": 1,
+                "signature_invalid": 2,
+                "unlock_failed": 1,
+            },
+            recent=[
+                ActivityEvent(
+                    ts=1700000000.0,
+                    event="unlock_success",
+                    detail="Gate",
+                    caller="+17075551111",
+                    call_sid="CA123",
+                )
+            ],
+            door_name="Gate",
+        ).decode("utf-8")
+        self.assertIn("Phone Gate Activity - Gate", rendered)
+        self.assertIn("Unlock Success", rendered)
+        self.assertIn("+17075551111", rendered)
+
+    def test_activity_store_persists_records(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "activity.sqlite3"
+            store_a = ActivityStore(str(db_path))
+            store_a.record(
+                "unlock_success",
+                detail="Gate",
+                caller="+17075551111",
+                call_sid="CA555",
+            )
+            store_b = ActivityStore(str(db_path))
+            counts, recent = store_b.snapshot(10)
+            self.assertEqual(counts.get("unlock_success"), 1)
+            self.assertEqual(len(recent), 1)
+            self.assertEqual(recent[0].call_sid, "CA555")
 
 
 if __name__ == "__main__":
