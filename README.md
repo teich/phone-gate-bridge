@@ -64,6 +64,8 @@ Required values:
 
 - `UNIFI_HOST`
 - `UNIFI_ACCESS_API_TOKEN`
+- `PUBLIC_BASE_URL` (example: `https://gate.teich.network`)
+- `TWILIO_AUTH_TOKEN` (from Twilio Console)
 - `ALLOWED_CALLERS` (comma-separated, E.164 recommended)
 
 Important:
@@ -83,6 +85,11 @@ In Twilio Console for your number:
 3. Save.
 
 No Twilio Function/Studio flow is required.
+
+Security note:
+
+- Incoming webhook requests are validated with `X-Twilio-Signature`.
+- `PUBLIC_BASE_URL` must exactly match the external URL Twilio calls.
 
 ## Cloudflare tunnel configuration
 
@@ -165,6 +172,8 @@ curl -sS -X POST "https://gate.example.com/twilio/voice" \
 ```
 
 Expected response contains a `<Gather ... action="/twilio/voice/confirm">`.
+
+Note: manual curl tests will return `403 forbidden` unless you include a valid Twilio signature.
 
 3. Simulate pressing 1:
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import os
 import xml.sax.saxutils as saxutils
 from dataclasses import dataclass
@@ -22,6 +25,8 @@ class WebhookConfig:
     bind_host: str = "127.0.0.1"
     bind_port: int = 8080
     allowed_callers: tuple[str, ...] = ()
+    twilio_auth_token: str = ""
+    public_base_url: str = ""
 
 
 def normalize_phone(value: str) -> str:
@@ -65,6 +70,31 @@ def twiml_gather(prompt: str, action: str) -> bytes:
     ).encode("utf-8")
 
 
+def build_twilio_signature(url: str, form: dict[str, list[str]], auth_token: str) -> str:
+    payload = url
+    for key in sorted(form.keys()):
+        for value in form[key]:
+            payload += key + value
+    digest = hmac.new(
+        auth_token.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha1,
+    ).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def is_valid_twilio_signature(
+    signature: str | None,
+    url: str,
+    form: dict[str, list[str]],
+    auth_token: str,
+) -> bool:
+    if not signature:
+        return False
+    expected = build_twilio_signature(url, form, auth_token)
+    return hmac.compare_digest(signature.strip(), expected)
+
+
 def load_config_from_env() -> WebhookConfig:
     host = os.getenv("UNIFI_HOST")
     token = os.getenv("UNIFI_ACCESS_API_TOKEN")
@@ -72,6 +102,12 @@ def load_config_from_env() -> WebhookConfig:
         raise ValueError("UNIFI_HOST is required")
     if not token:
         raise ValueError("UNIFI_ACCESS_API_TOKEN is required")
+    twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not twilio_auth_token:
+        raise ValueError("TWILIO_AUTH_TOKEN is required")
+    public_base_url = os.getenv("PUBLIC_BASE_URL")
+    if not public_base_url:
+        raise ValueError("PUBLIC_BASE_URL is required")
 
     allowed_raw = os.getenv("ALLOWED_CALLERS", "")
     allowed = tuple(
@@ -96,6 +132,8 @@ def load_config_from_env() -> WebhookConfig:
         bind_host=os.getenv("WEBHOOK_BIND_HOST", "127.0.0.1"),
         bind_port=int(os.getenv("WEBHOOK_BIND_PORT", "8080")),
         allowed_callers=allowed,
+        twilio_auth_token=twilio_auth_token,
+        public_base_url=public_base_url.rstrip("/"),
     )
 
 
@@ -111,6 +149,17 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8", errors="replace")
         form = parse_qs(body, keep_blank_values=True)
+        request_url = f"{self.config.public_base_url}{path}"
+        signature = self.headers.get("X-Twilio-Signature")
+        if not is_valid_twilio_signature(
+            signature=signature,
+            url=request_url,
+            form=form,
+            auth_token=self.config.twilio_auth_token,
+        ):
+            self._send_plain(403, b"forbidden")
+            return
+
         from_number = form.get("From", [""])[0]
         call_sid = form.get("CallSid", [""])[0]
 
@@ -180,6 +229,13 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
     def _send_response(self, status: int, body: bytes) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "text/xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_plain(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
