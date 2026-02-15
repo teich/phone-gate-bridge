@@ -1,0 +1,14 @@
+# Keep one [[callers]] block per phone number.
+# Numbers should be in E.164 format when possible.
+
+[[callers]]
+number = "+17075551111"
+name = "Oren Teich"
+notes = "Owner"
+enabled = true
+
+[[callers]]
+number = "+17075552222"
+name = "Connie"
+notes = "Family"
+enabled = true

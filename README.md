@@ -5,7 +5,7 @@ Phone-call to UniFi Access gate unlock bridge.
 ## What it does
 
 - Twilio sends inbound call webhooks to `/twilio/voice`.
-- Service checks caller ID against `ALLOWED_CALLERS`.
+- Service checks caller ID against a callers file (`ALLOWED_CALLERS_FILE`).
 - If allowed, caller must press `1` (DTMF) to open.
 - Only when digit `1` is received on `/twilio/voice/confirm`, it resolves door by name (default `Gate`) and unlocks through UniFi Access API.
 - It answers the call with TwiML:
@@ -71,7 +71,13 @@ Required values:
 - `UNIFI_ACCESS_API_TOKEN`
 - `PUBLIC_BASE_URL` (example: `https://gate.teich.network`)
 - `TWILIO_AUTH_TOKEN` (from Twilio Console)
-- `ALLOWED_CALLERS` (comma-separated, E.164 recommended)
+- `ALLOWED_CALLERS_FILE` (example: `/etc/phone-gate-bridge/allowed-callers.toml`)
+
+Caller allowlist file:
+
+- Copy `/opt/phone-gate-bridge/deploy/config/allowed-callers.toml.example` to `/etc/phone-gate-bridge/allowed-callers.toml`.
+- Edit that file to add/remove numbers and metadata (`name`, `notes`, `enabled`).
+- The webhook reads this file on each request, so number changes do not require redeploy.
 
 Important:
 
@@ -87,6 +93,13 @@ sudo install -m 640 -o root -g gatebridge /opt/phone-gate-bridge/.env /etc/phone
 
 ```bash
 sudo /opt/phone-gate-bridge/deploy/validate-env.sh /etc/phone-gate-bridge/phone-gate-bridge.env
+```
+
+- Install callers file:
+
+```bash
+sudo install -m 640 -o root -g gatebridge /opt/phone-gate-bridge/deploy/config/allowed-callers.toml.example /etc/phone-gate-bridge/allowed-callers.toml
+sudoedit /etc/phone-gate-bridge/allowed-callers.toml
 ```
 
 ## Twilio configuration
@@ -155,6 +168,7 @@ sudo -u gatebridge git clone <YOUR_GITHUB_REPO_URL> /opt/phone-gate-bridge
 sudo -u gatebridge python3 -m venv /opt/phone-gate-bridge/.venv
 sudo -u gatebridge /opt/phone-gate-bridge/.venv/bin/pip install -e /opt/phone-gate-bridge
 sudo install -m 640 -o root -g gatebridge /opt/phone-gate-bridge/.env /etc/phone-gate-bridge/phone-gate-bridge.env
+sudo install -m 640 -o root -g gatebridge /opt/phone-gate-bridge/deploy/config/allowed-callers.toml.example /etc/phone-gate-bridge/allowed-callers.toml
 sudo chown root:gatebridge /etc/phone-gate-bridge/phone-gate-bridge.env
 sudo chmod 640 /etc/phone-gate-bridge/phone-gate-bridge.env
 sudo cp /opt/phone-gate-bridge/deploy/systemd/phone-gate-webhook.service /etc/systemd/system/
@@ -183,6 +197,7 @@ sudo rsync -a --delete ./ /opt/phone-gate-bridge/
 sudo -u gatebridge python3 -m venv /opt/phone-gate-bridge/.venv
 sudo -u gatebridge /opt/phone-gate-bridge/.venv/bin/pip install -e /opt/phone-gate-bridge
 sudo install -m 640 -o root -g gatebridge .env /etc/phone-gate-bridge/phone-gate-bridge.env
+sudo install -m 640 -o root -g gatebridge deploy/config/allowed-callers.toml.example /etc/phone-gate-bridge/allowed-callers.toml
 sudo chown -R gatebridge:gatebridge /opt/phone-gate-bridge
 sudo chown root:gatebridge /etc/phone-gate-bridge/phone-gate-bridge.env
 sudo chmod 640 /etc/phone-gate-bridge/phone-gate-bridge.env

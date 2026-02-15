@@ -24,7 +24,6 @@ required_vars=(
   UNIFI_ACCESS_API_TOKEN
   PUBLIC_BASE_URL
   TWILIO_AUTH_TOKEN
-  ALLOWED_CALLERS
 )
 
 missing=()
@@ -36,6 +35,18 @@ done
 
 if (( ${#missing[@]} > 0 )); then
   echo "ERROR: missing required env vars in $ENV_FILE: ${missing[*]}"
+  exit 1
+fi
+
+ALLOWED_CALLERS_FILE="${ALLOWED_CALLERS_FILE:-/etc/phone-gate-bridge/allowed-callers.toml}"
+if [[ ! -f "$ALLOWED_CALLERS_FILE" ]]; then
+  echo "ERROR: allowed callers file not found: $ALLOWED_CALLERS_FILE"
+  echo "Hint: copy /opt/phone-gate-bridge/deploy/config/allowed-callers.toml.example to that path"
+  exit 1
+fi
+
+if [[ ! -r "$ALLOWED_CALLERS_FILE" ]]; then
+  echo "ERROR: allowed callers file is not readable: $ALLOWED_CALLERS_FILE"
   exit 1
 fi
 

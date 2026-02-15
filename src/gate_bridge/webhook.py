@@ -11,6 +11,11 @@ from urllib.parse import parse_qs, urlparse
 
 from gate_bridge.client import AccessApiError, AccessClient
 
+try:
+    import tomllib  # type: ignore[attr-defined]
+except ModuleNotFoundError:
+    tomllib = None
+
 
 @dataclass(frozen=True)
 class WebhookConfig:
@@ -24,9 +29,17 @@ class WebhookConfig:
     actor_name: str = "Phone Gate Bridge"
     bind_host: str = "127.0.0.1"
     bind_port: int = 8080
-    allowed_callers: tuple[str, ...] = ()
+    allowed_callers_file: str = "/etc/phone-gate-bridge/allowed-callers.toml"
     twilio_auth_token: str = ""
     public_base_url: str = ""
+
+
+@dataclass(frozen=True)
+class AllowedCaller:
+    number: str
+    name: str = ""
+    enabled: bool = True
+    notes: str = ""
 
 
 def normalize_phone(value: str) -> str:
@@ -36,12 +49,80 @@ def normalize_phone(value: str) -> str:
     return "".join(ch for ch in value if ch.isdigit())
 
 
-def is_allowed_caller(caller: str, allowed_callers: tuple[str, ...]) -> bool:
+def load_allowed_callers(path: str) -> tuple[AllowedCaller, ...]:
+    parsed: dict
+    if tomllib is not None:
+        with open(path, "rb") as f:
+            parsed = tomllib.load(f)
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            parsed = _parse_simple_callers_toml(f.read())
+
+    raw_callers = parsed.get("callers")
+    if not isinstance(raw_callers, list):
+        raise ValueError("allowed callers file must contain [[callers]] entries")
+
+    callers: list[AllowedCaller] = []
+    for entry in raw_callers:
+        if not isinstance(entry, dict):
+            continue
+        number_raw = str(entry.get("number", "")).strip()
+        number = normalize_phone(number_raw)
+        if not number:
+            continue
+        enabled = bool(entry.get("enabled", True))
+        name = str(entry.get("name", "")).strip()
+        notes = str(entry.get("notes", "")).strip()
+        callers.append(
+            AllowedCaller(
+                number=number,
+                name=name,
+                enabled=enabled,
+                notes=notes,
+            )
+        )
+    return tuple(callers)
+
+
+def _parse_simple_callers_toml(text: str) -> dict:
+    callers: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line == "[[callers]]":
+            current = {}
+            callers.append(current)
+            continue
+        if current is None:
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        k = key.strip()
+        v = value.strip()
+        if v.startswith('"') and v.endswith('"') and len(v) >= 2:
+            current[k] = v[1:-1]
+        elif v.lower() in {"true", "false"}:
+            current[k] = v.lower() == "true"
+        else:
+            current[k] = v
+
+    return {"callers": callers}
+
+
+def find_allowed_caller(
+    caller: str, allowed_callers: tuple[AllowedCaller, ...]
+) -> AllowedCaller | None:
     normalized_caller = normalize_phone(caller)
     if not normalized_caller:
-        return False
-    normalized_allowed = {normalize_phone(item) for item in allowed_callers}
-    return normalized_caller in normalized_allowed
+        return None
+    for allowed in allowed_callers:
+        if allowed.enabled and allowed.number == normalized_caller:
+            return allowed
+    return None
 
 
 def twiml_say(message: str) -> bytes:
@@ -109,16 +190,14 @@ def load_config_from_env() -> WebhookConfig:
     if not public_base_url:
         raise ValueError("PUBLIC_BASE_URL is required")
 
-    allowed_raw = os.getenv("ALLOWED_CALLERS", "")
-    allowed = tuple(
-        normalize_phone(item)
-        for item in (piece.strip() for piece in allowed_raw.split(","))
-        if item
-    )
-    if not allowed:
-        raise ValueError("ALLOWED_CALLERS is required (comma-separated list)")
-
     insecure = os.getenv("UNIFI_INSECURE_TLS", "false").lower() in {"1", "true", "yes"}
+    allowed_callers_file = os.getenv(
+        "ALLOWED_CALLERS_FILE",
+        "/etc/phone-gate-bridge/allowed-callers.toml",
+    )
+    if not os.path.isfile(allowed_callers_file):
+        raise ValueError(f"ALLOWED_CALLERS_FILE does not exist: {allowed_callers_file}")
+    load_allowed_callers(allowed_callers_file)
 
     return WebhookConfig(
         host=host,
@@ -131,7 +210,7 @@ def load_config_from_env() -> WebhookConfig:
         actor_name=os.getenv("UNIFI_ACTOR_NAME", "Phone Gate Bridge"),
         bind_host=os.getenv("WEBHOOK_BIND_HOST", "127.0.0.1"),
         bind_port=int(os.getenv("WEBHOOK_BIND_PORT", "8080")),
-        allowed_callers=allowed,
+        allowed_callers_file=allowed_callers_file,
         twilio_auth_token=twilio_auth_token,
         public_base_url=public_base_url.rstrip("/"),
     )
@@ -162,8 +241,17 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
 
         from_number = form.get("From", [""])[0]
         call_sid = form.get("CallSid", [""])[0]
+        try:
+            allowed_callers = load_allowed_callers(self.config.allowed_callers_file)
+        except (OSError, ValueError):
+            self._send_response(
+                200,
+                twiml_say("Unable to verify access right now. Please try again."),
+            )
+            return
+        allowed_caller = find_allowed_caller(from_number, allowed_callers)
 
-        if not is_allowed_caller(from_number, self.config.allowed_callers):
+        if allowed_caller is None:
             self._send_response(
                 200,
                 twiml_say("This incoming number is not authorized for this gate."),
@@ -204,6 +292,7 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
                     "from": from_number,
                     "call_sid": call_sid,
                     "digit": digit,
+                    "caller_name": allowed_caller.name,
                 },
             )
             self._send_response(200, twiml_say("The gate is now open."))
