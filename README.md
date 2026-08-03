@@ -6,11 +6,15 @@ Phone-call to UniFi Access gate unlock bridge.
 
 - Twilio sends inbound call webhooks to `/twilio/voice`.
 - Service checks caller ID against a callers file (`ALLOWED_CALLERS_FILE`).
-- If allowed, caller must press `1` (DTMF) to open.
-- Only when digit `1` is received on `/twilio/voice/confirm`, it resolves door by name (default `Gate`) and unlocks through UniFi Access API.
+- If allowed, caller can press `1` (DTMF) to open or, when granted the
+  `hold_open` action, press `2` to hold the gate open for 30 minutes.
+- Only when a valid digit is received on `/twilio/voice/confirm`, it resolves
+  the door by name (default `Gate`) and sends the corresponding command through
+  the UniFi Access API.
 - It answers the call with TwiML:
-  - Step 1 (allowed): "Press 1 now to open the gate."
+  - Step 1 (allowed): advertises the actions granted to that caller.
   - Step 2 (allowed + pressed 1): "The gate is now open."
+  - Step 2 (allowed + pressed 2): "The gate will remain open for 30 minutes."
   - Blocked: "This incoming number is not authorized for this gate."
 
 ## Project commands
@@ -124,31 +128,27 @@ A momentary unlock can finish between polls without ever showing on the door
 record, so a `unlock_success` in the last 12 seconds is also surfaced as
 **Opening** straight from the activity log.
 
-### Hold-open foundation
+### Hold open
 
-The activity model already supports finite, clearable holds:
+Digit `2` sets a controller-side temporary locking rule for 30 minutes:
 
 ```python
-activity.record_hold_open(
-    duration_seconds=30 * 60,
-    caller=from_number,
-    call_sid=call_sid,
+client.set_temporary_unlock(
+    door_id=door_id,
+    duration_minutes=30,
 )
-activity.record_hold_cleared(caller=from_number, reason="manual")
 ```
 
-The dashboard shows a hold only while it is unexpired, not cleared, and the
-physical gate is open/opening. The SQLite event includes absolute start and
-expiry times, so restart does not lose the timer.
+UniFi Access owns the finite timer, while the matching SQLite event gives the
+dashboard an absolute start and expiry time that survives a service restart.
+The dashboard shows the hold only while it is unexpired and the physical gate
+is open/opening.
 
-This is only the durable state foundation. `AccessClient` does not yet implement
-a verified UniFi hold-open command, and digit `2` is intentionally not
-advertised until that controller operation is confirmed. When it is added,
-grant `hold_open` only to callers that should receive that higher-impact action.
-The action-reservation table already prevents duplicate Twilio callbacks from
-executing a controller command twice. If the service restarts mid-command, the
-reservation becomes `unknown` and is never replayed automatically; the caller
-is told to check the gate before trying again.
+Grant `hold_open` only to callers that should receive that higher-impact action.
+The action-reservation table prevents duplicate Twilio callbacks from executing
+the command twice. If the service restarts mid-command, the reservation becomes
+`unknown` and is never replayed automatically; the caller is told to check the
+gate before trying again.
 
 ### Dashboard development
 
@@ -203,8 +203,8 @@ Caller allowlist file:
 
 - Copy `/opt/phone-gate-bridge/deploy/config/allowed-callers.toml.example` to `/etc/phone-gate-bridge/allowed-callers.toml`.
 - Edit that file to add/remove numbers and metadata (`name`, `notes`, `enabled`,
-  `actions`). Existing entries default to `actions = ["open"]`; `hold_open`
-  remains explicit and is not implemented yet.
+  `actions`). Existing entries default to `actions = ["open"]`; add
+  `hold_open` explicitly for callers who may use digit `2`.
 - The webhook reads this file on each request, so number changes do not require redeploy.
 
 Important:

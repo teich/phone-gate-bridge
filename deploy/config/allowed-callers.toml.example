@@ -6,7 +6,7 @@ number = "+17075551111"
 name = "Oren Teich"
 notes = "Owner"
 enabled = true
-actions = ["open"]
+actions = ["open", "hold_open"]
 
 [[callers]]
 number = "+17075552222"

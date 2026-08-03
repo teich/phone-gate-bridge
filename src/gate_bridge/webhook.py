@@ -33,7 +33,8 @@ except ModuleNotFoundError:
 
 IpNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 KNOWN_CALLER_ACTIONS = frozenset({"open", "hold_open"})
-DTMF_ACTIONS = {"1": "open"}
+DTMF_ACTIONS = {"1": "open", "2": "hold_open"}
+HOLD_OPEN_MINUTES = 30
 LEGACY_DASHBOARD_DB_PATH = "var/activity.sqlite3"
 STATE_DASHBOARD_DB_PATH = "/var/lib/phone-gate-bridge/activity.sqlite3"
 
@@ -258,6 +259,17 @@ def twiml_gather(
     ).encode("utf-8")
 
 
+def caller_prompt(actions: tuple[str, ...]) -> str:
+    choices: list[str] = []
+    if "open" in actions:
+        choices.append("Press 1 now to open the gate.")
+    if "hold_open" in actions:
+        choices.append(
+            f"Press 2 to hold the gate open for {HOLD_OPEN_MINUTES} minutes."
+        )
+    return " ".join(choices) or "No gate actions are available for this number."
+
+
 def build_twilio_signature(url: str, form: dict[str, list[str]], auth_token: str) -> str:
     payload = url
     for key in sorted(form.keys()):
@@ -478,7 +490,7 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
             self._send_response(
                 200,
                 twiml_gather(
-                    "Press 1 now to open the gate.",
+                    caller_prompt(allowed_caller.actions),
                     "/twilio/voice/confirm",
                     self.config.twilio_tts_voice,
                 ),
@@ -517,6 +529,14 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
 
         if action == "open":
             self._perform_open(
+                caller=from_number,
+                call_sid=call_sid,
+                digit=digit,
+                allowed_caller=allowed_caller,
+            )
+            return
+        if action == "hold_open":
+            self._perform_hold_open(
                 caller=from_number,
                 call_sid=call_sid,
                 digit=digit,
@@ -665,6 +685,107 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
         self._send_response(
             200,
             twiml_say("The gate is now open.", self.config.twilio_tts_voice),
+        )
+
+    def _perform_hold_open(
+        self,
+        *,
+        caller: str,
+        call_sid: str,
+        digit: str,
+        allowed_caller: AllowedCaller,
+    ) -> None:
+        action = "hold_open"
+        try:
+            attempt, created = self.activity.begin_action(
+                call_sid=call_sid,
+                action=action,
+                caller=caller,
+            )
+        except ValueError as exc:
+            self.activity.record(
+                "action_failed",
+                detail=str(exc),
+                caller=caller,
+                call_sid=call_sid,
+            )
+            self._send_response(
+                200,
+                twiml_say(
+                    "Unable to hold the gate open right now. Please try again.",
+                    self.config.twilio_tts_voice,
+                ),
+            )
+            return
+
+        if not created:
+            if attempt.status == "succeeded":
+                message = (
+                    f"The gate will remain open for {HOLD_OPEN_MINUTES} minutes."
+                )
+            elif attempt.status == "pending":
+                message = "This gate request is already being processed."
+            elif attempt.status == "unknown":
+                message = (
+                    "The previous hold-open request has an unknown result. "
+                    "Please check the gate before trying again."
+                )
+            else:
+                message = (
+                    "Unable to hold the gate open right now. Please try again."
+                )
+            self._send_response(200, twiml_say(message, self.config.twilio_tts_voice))
+            return
+
+        client = self._access_client()
+        try:
+            door_id = client.find_door_id(self.config.door_name)
+            client.set_temporary_unlock(
+                door_id=door_id,
+                duration_minutes=HOLD_OPEN_MINUTES,
+            )
+        except (AccessApiError, ValueError) as exc:
+            self.activity.finish_action_with_event(
+                call_sid=call_sid,
+                action=action,
+                status="failed",
+                event="action_failed",
+                event_detail=str(exc),
+                caller=caller,
+                data={"action": action},
+            )
+            self._send_response(
+                200,
+                twiml_say(
+                    "Unable to hold the gate open right now. Please try again.",
+                    self.config.twilio_tts_voice,
+                ),
+            )
+            return
+
+        completed_at = time.time()
+        duration_seconds = HOLD_OPEN_MINUTES * 60
+        self.activity.finish_action_with_event(
+            call_sid=call_sid,
+            action=action,
+            status="succeeded",
+            event="hold_open",
+            event_detail=str(HOLD_OPEN_MINUTES),
+            caller=caller,
+            data={
+                "duration_seconds": duration_seconds,
+                "expires_at": completed_at + duration_seconds,
+                "digit": digit,
+                "caller_name": allowed_caller.name,
+            },
+            at=completed_at,
+        )
+        self._send_response(
+            200,
+            twiml_say(
+                f"The gate will remain open for {HOLD_OPEN_MINUTES} minutes.",
+                self.config.twilio_tts_voice,
+            ),
         )
 
     def do_GET(self) -> None:  # noqa: N802

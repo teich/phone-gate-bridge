@@ -16,6 +16,7 @@ from gate_bridge.webhook import (
     TwilioWebhookHandler,
     WebhookConfig,
     build_twilio_signature,
+    caller_prompt,
     find_allowed_caller,
     is_ip_allowed,
     is_valid_twilio_signature,
@@ -172,6 +173,17 @@ class WebhookHelpersTests(unittest.TestCase):
             rendered,
         )
 
+    def test_caller_prompt_includes_only_authorized_actions(self):
+        self.assertEqual(
+            caller_prompt(("open",)),
+            "Press 1 now to open the gate.",
+        )
+        self.assertEqual(
+            caller_prompt(("open", "hold_open")),
+            "Press 1 now to open the gate. "
+            "Press 2 to hold the gate open for 30 minutes.",
+        )
+
     def test_twilio_signature_valid(self):
         url = "https://gate.teich.network/twilio/voice"
         form = {
@@ -251,6 +263,8 @@ class WebhookHelpersTests(unittest.TestCase):
 
 class FakeAccessClient:
     unlock_calls = 0
+    temporary_unlock_calls = 0
+    temporary_unlock_minutes = None
 
     def __init__(self, **_kwargs):
         pass
@@ -260,6 +274,11 @@ class FakeAccessClient:
 
     def unlock_door(self, **_kwargs):
         type(self).unlock_calls += 1
+        return {"code": "SUCCESS"}
+
+    def set_temporary_unlock(self, *, duration_minutes, **_kwargs):
+        type(self).temporary_unlock_calls += 1
+        type(self).temporary_unlock_minutes = duration_minutes
         return {"code": "SUCCESS"}
 
 
@@ -279,7 +298,7 @@ class HandlerIntegrationTests(unittest.TestCase):
                     "[[callers]]",
                     'number = "+17075551111"',
                     'name = "Oren"',
-                    'actions = ["open"]',
+                    'actions = ["open", "hold_open"]',
                     "enabled = true",
                 ]
             ),
@@ -308,6 +327,8 @@ class HandlerIntegrationTests(unittest.TestCase):
             },
         )
         FakeAccessClient.unlock_calls = 0
+        FakeAccessClient.temporary_unlock_calls = 0
+        FakeAccessClient.temporary_unlock_minutes = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -385,6 +406,41 @@ class HandlerIntegrationTests(unittest.TestCase):
         self.assertEqual(FakeAccessClient.unlock_calls, 1)
         counts, _ = self.store.snapshot(50)
         self.assertEqual(counts["unlock_success"], 1)
+
+    def test_press_two_holds_gate_open_for_thirty_minutes(self):
+        values = {
+            "From": "+17075551111",
+            "CallSid": "CA-hold-open",
+            "Digits": "2",
+        }
+        status, _, body = self.signed_post("/twilio/voice/confirm", values)
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"remain open for 30 minutes", body)
+        self.assertEqual(FakeAccessClient.temporary_unlock_calls, 1)
+        self.assertEqual(FakeAccessClient.temporary_unlock_minutes, 30)
+        hold = self.store.active_hold()
+        self.assertIsNotNone(hold)
+        self.assertEqual(hold.duration_seconds, 30 * 60)
+        counts, _ = self.store.snapshot(50)
+        self.assertEqual(counts["hold_open"], 1)
+
+    def test_duplicate_hold_open_confirm_changes_controller_once(self):
+        values = {
+            "From": "+17075551111",
+            "CallSid": "CA-hold-open-duplicate",
+            "Digits": "2",
+        }
+        first_status, _, first = self.signed_post("/twilio/voice/confirm", values)
+        second_status, _, second = self.signed_post("/twilio/voice/confirm", values)
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertIn(b"remain open for 30 minutes", first)
+        self.assertIn(b"remain open for 30 minutes", second)
+        self.assertEqual(FakeAccessClient.temporary_unlock_calls, 1)
+        counts, _ = self.store.snapshot(50)
+        self.assertEqual(counts["hold_open"], 1)
 
     def test_oversized_body_is_rejected_before_reading_or_signature_work(self):
         status, _, body = self.request(

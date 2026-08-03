@@ -156,6 +156,31 @@ class AccessClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.unlock_door(door_id="door-123", actor_name="only-name")
 
+    def test_temporary_unlock_request_contains_duration(self):
+        client = AccessClient(host="192.168.1.1", token="token-abc")
+
+        with patch("gate_bridge.client.request.urlopen") as mocked:
+            mocked.return_value = FakeResponse('{"code":"SUCCESS","data":"success"}')
+
+            response = client.set_temporary_unlock(
+                door_id="door-123",
+                duration_minutes=30,
+            )
+
+            self.assertEqual(response["code"], "SUCCESS")
+            req = mocked.call_args.args[0]
+            self.assertEqual(req.get_method(), "PUT")
+            self.assertIn("/api/v1/developer/doors/door-123/lock_rule", req.full_url)
+            self.assertEqual(req.get_header("Authorization"), "Bearer token-abc")
+            sent = json.loads(req.data.decode("utf-8"))
+            self.assertEqual(sent, {"type": "custom", "interval": 30})
+
+    def test_temporary_unlock_requires_positive_duration(self):
+        client = AccessClient(host="192.168.1.1", token="token-abc")
+
+        with self.assertRaises(ValueError):
+            client.set_temporary_unlock(door_id="door-123", duration_minutes=0)
+
     def test_http_error_is_wrapped(self):
         client = AccessClient(host="192.168.1.1", token="token-abc")
         http_error = HTTPError(

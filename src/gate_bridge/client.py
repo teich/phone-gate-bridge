@@ -126,6 +126,39 @@ class AccessClient:
 
         return self._send(req)
 
+    def set_temporary_unlock(
+        self,
+        door_id: str,
+        *,
+        duration_minutes: int,
+    ) -> dict[str, Any]:
+        """Keep a door unlocked for a finite number of whole minutes."""
+        if not door_id:
+            raise ValueError("door_id is required")
+        if duration_minutes <= 0:
+            raise ValueError("duration_minutes must be positive")
+
+        url = (
+            f"https://{self.host}:{self.port}"
+            f"/api/v1/developer/doors/{door_id}/lock_rule"
+        )
+        body = json.dumps(
+            {
+                "type": "custom",
+                "interval": duration_minutes,
+            }
+        ).encode("utf-8")
+        req = request.Request(
+            url=url,
+            method="PUT",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        return self._send(req)
+
     def _send(self, req: request.Request) -> dict[str, Any]:
         context = ssl.create_default_context()
         if not self.verify_tls:
