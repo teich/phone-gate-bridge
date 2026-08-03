@@ -23,6 +23,17 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+Install the dashboard toolchain and build the committed production bundle:
+
+```bash
+npm --prefix frontend ci
+npm --prefix frontend run check
+npm --prefix frontend run build
+```
+
+Node is only needed for dashboard development. The Debian host runs the
+compiled assets from the Python package and does not need Node or npm.
+
 List doors:
 
 ```bash
@@ -72,15 +83,22 @@ It shows:
 - **Activity** — one row per phone call, filterable, with caller names resolved
   from `ALLOWED_CALLERS_FILE`.
 
-Two routes back the page:
+The dashboard is a Vite/React/TypeScript application compiled into the Python
+package. Python remains the only production process and owns all Twilio, UniFi,
+SQLite, and authorization work.
 
 | Route | Purpose |
 |---|---|
-| `GET /dashboard` | The page. CSS and JS are inlined, so there is one request. |
+| `GET /dashboard` | Compiled React page. |
+| `GET /dashboard/assets/*` | Hashed JS/CSS with immutable browser caching. |
 | `GET /dashboard/api/state` | JSON state; the page polls it every 3s. |
 
-Both are behind the same CIDR check. Page loads are audited as `dashboard_view`;
-the polled state endpoint is not, so it does not flood the log.
+Every dashboard route is behind the same CIDR check. Page loads are audited as
+`dashboard_view`; assets and polled state are not. The API contract is explicitly
+versioned, and activity rows carry stable `call:<CallSid>` or `event:<sqlite-id>`
+identities. Combined with ignoring poll responses whose semantic state did not
+change, React updates only the rows that actually changed instead of rebuilding
+the page on every refresh.
 
 ### Where gate status comes from
 
@@ -106,25 +124,44 @@ A momentary unlock can finish between polls without ever showing on the door
 record, so a `unlock_success` in the last 12 seconds is also surfaced as
 **Opening** straight from the activity log.
 
-### Contract for caller-initiated hold-open
+### Hold-open foundation
 
-When hold-open is added, record the activity event below and the dashboard picks
-it up with no further changes:
+The activity model already supports finite, clearable holds:
 
 ```python
-activity.record("hold_open", detail=str(minutes), caller=from_number, call_sid=call_sid)
+activity.record_hold_open(
+    duration_seconds=30 * 60,
+    caller=from_number,
+    call_sid=call_sid,
+)
+activity.record_hold_cleared(caller=from_number, reason="manual")
 ```
 
-`detail` must be the hold length in whole minutes. The lock rule supplies the
-expiry; this event supplies the *original* duration, which is what lets the
-countdown ring show elapsed-vs-total instead of guessing. Without it the ring
-still counts down, using the largest remaining time it has observed as the span.
+The dashboard shows a hold only while it is unexpired, not cleared, and the
+physical gate is open/opening. The SQLite event includes absolute start and
+expiry times, so restart does not lose the timer.
 
-### Editing the look
+This is only the durable state foundation. `AccessClient` does not yet implement
+a verified UniFi hold-open command, and digit `2` is intentionally not
+advertised until that controller operation is confirmed. When it is added,
+grant `hold_open` only to callers that should receive that higher-impact action.
+The action-reservation table already prevents duplicate Twilio callbacks from
+executing a controller command twice. If the service restarts mid-command, the
+reservation becomes `unknown` and is never replayed automatically; the caller
+is told to check the gate before trying again.
 
-Styles and behaviour live in `src/gate_bridge/static/dashboard.css` and
-`dashboard.js`. They are read from disk once per process and cached, so restart
-the service after editing them.
+### Dashboard development
+
+Source lives in `frontend/src`. During development, run:
+
+```bash
+npm --prefix frontend run dev
+```
+
+Vite proxies `/dashboard/api/*` to the Python service on port `8080`. Production
+output is committed under `src/gate_bridge/static/dashboard` because the gate
+host intentionally has no Node toolchain. Always run the frontend check and
+build commands before committing dashboard changes.
 
 ## Environment file
 
@@ -145,12 +182,17 @@ Required values:
 - `ALLOWED_CALLERS_FILE` (example: `/etc/phone-gate-bridge/allowed-callers.toml`)
 - `DASHBOARD_ALLOWED_CIDRS` (optional, default: `127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`)
 - `DASHBOARD_RECENT_EVENTS_LIMIT` (optional, default: `100`)
-- `DASHBOARD_DB_PATH` (optional, default: `var/activity.sqlite3`)
+- `DASHBOARD_DB_PATH` (optional; new installs default to
+  `/var/lib/phone-gate-bridge/activity.sqlite3`, while an existing
+  `var/activity.sqlite3` is reused automatically)
+- `MAX_WEBHOOK_BODY_BYTES` (optional, default: `16384`)
 
 Caller allowlist file:
 
 - Copy `/opt/phone-gate-bridge/deploy/config/allowed-callers.toml.example` to `/etc/phone-gate-bridge/allowed-callers.toml`.
-- Edit that file to add/remove numbers and metadata (`name`, `notes`, `enabled`).
+- Edit that file to add/remove numbers and metadata (`name`, `notes`, `enabled`,
+  `actions`). Existing entries default to `actions = ["open"]`; `hold_open`
+  remains explicit and is not implemented yet.
 - The webhook reads this file on each request, so number changes do not require redeploy.
 
 Important:
@@ -248,7 +290,7 @@ sudo mkdir -p /opt/phone-gate-bridge /etc/phone-gate-bridge
 sudo chown -R gatebridge:gatebridge /opt/phone-gate-bridge
 sudo -u gatebridge git clone <YOUR_GITHUB_REPO_URL> /opt/phone-gate-bridge
 sudo -u gatebridge python3 -m venv /opt/phone-gate-bridge/.venv
-sudo -u gatebridge /opt/phone-gate-bridge/.venv/bin/pip install -e /opt/phone-gate-bridge
+sudo -u gatebridge /opt/phone-gate-bridge/.venv/bin/pip install /opt/phone-gate-bridge
 sudo install -m 640 -o root -g gatebridge /opt/phone-gate-bridge/.env /etc/phone-gate-bridge/phone-gate-bridge.env
 sudo install -m 640 -o root -g gatebridge /opt/phone-gate-bridge/deploy/config/allowed-callers.toml.example /etc/phone-gate-bridge/allowed-callers.toml
 sudo chown root:gatebridge /etc/phone-gate-bridge/phone-gate-bridge.env
@@ -258,11 +300,28 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now phone-gate-webhook.service
 ```
 
+The unit creates `/var/lib/phone-gate-bridge` via `StateDirectory` and confines
+service writes to that directory. It temporarily also permits
+`/opt/phone-gate-bridge/var` so existing installations can keep their current
+database until it is deliberately migrated.
+
 Update deploys (recommended):
 
 ```bash
 sudo /opt/phone-gate-bridge/deploy/deploy-phone-gate.sh
 ```
+
+For the **first deployment of this release**, bootstrap only the new deploy
+script before running it. This keeps the current commit available for rollback:
+
+```bash
+sudo -u gatebridge git -C /opt/phone-gate-bridge fetch origin main
+sudo -u gatebridge git -C /opt/phone-gate-bridge checkout origin/main -- deploy/deploy-phone-gate.sh
+sudo /opt/phone-gate-bridge/deploy/deploy-phone-gate.sh
+```
+
+After that one-time handoff, the deploy script re-executes its freshly fetched
+version automatically on each rollout.
 
 Optional variables for deploy script:
 
@@ -270,24 +329,30 @@ Optional variables for deploy script:
 sudo APP_DIR=/opt/phone-gate-bridge APP_USER=gatebridge BRANCH=main SERVICE_NAME=phone-gate-webhook.service ENV_FILE=/etc/phone-gate-bridge/phone-gate-bridge.env /opt/phone-gate-bridge/deploy/deploy-phone-gate.sh
 ```
 
-Legacy/manual approach:
+The deploy script validates the committed dashboard bundle, runs backend tests,
+installs the exact commit from a clean Git archive, updates the systemd sandbox,
+restarts, and checks `/healthz` with a bounded startup window. A failed step,
+restart, or health check rolls back the checkout and installed package.
+
+### Moving an existing activity database
+
+Do not simply change `DASHBOARD_DB_PATH`, or the dashboard will appear to lose
+its history. For an installation currently using
+`/opt/phone-gate-bridge/var/activity.sqlite3`:
 
 ```bash
-sudo useradd --system --home /opt/phone-gate-bridge --shell /usr/sbin/nologin gatebridge || true
-sudo mkdir -p /opt/phone-gate-bridge /etc/phone-gate-bridge
-sudo rsync -a --delete ./ /opt/phone-gate-bridge/
-sudo -u gatebridge python3 -m venv /opt/phone-gate-bridge/.venv
-sudo -u gatebridge /opt/phone-gate-bridge/.venv/bin/pip install -e /opt/phone-gate-bridge
-sudo install -m 640 -o root -g gatebridge .env /etc/phone-gate-bridge/phone-gate-bridge.env
-sudo install -m 640 -o root -g gatebridge deploy/config/allowed-callers.toml.example /etc/phone-gate-bridge/allowed-callers.toml
-sudo chown -R gatebridge:gatebridge /opt/phone-gate-bridge
-sudo chown root:gatebridge /etc/phone-gate-bridge/phone-gate-bridge.env
-sudo chmod 640 /etc/phone-gate-bridge/phone-gate-bridge.env
-sudo cp deploy/systemd/phone-gate-webhook.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now phone-gate-webhook.service
-sudo systemctl status phone-gate-webhook.service
+sudo systemctl stop phone-gate-webhook.service
+sudo install -d -m 750 -o gatebridge -g gatebridge /var/lib/phone-gate-bridge
+sudo -u gatebridge python3 -c \
+  'import sqlite3; source=sqlite3.connect("/opt/phone-gate-bridge/var/activity.sqlite3"); target=sqlite3.connect("/var/lib/phone-gate-bridge/activity.sqlite3"); source.backup(target); target.close(); source.close()'
+sudoedit /etc/phone-gate-bridge/phone-gate-bridge.env
+# Set DASHBOARD_DB_PATH=/var/lib/phone-gate-bridge/activity.sqlite3
+sudo systemctl start phone-gate-webhook.service
+curl -fsS http://127.0.0.1:8080/healthz
 ```
+
+Keep the old database until the activity history has been verified in the
+dashboard.
 
 ### 2) Cloudflare tunnel service
 
@@ -334,4 +399,10 @@ curl -sS -X POST "https://gate.example.com/twilio/voice/confirm" \
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py' -v
+npm --prefix frontend run check
+npm --prefix frontend run build
 ```
+
+The Python suite covers database migration, hold lifecycle, action idempotency,
+the versioned API, compiled assets, and live HTTP handler flows. The frontend
+suite checks contract parsing and activity filtering.

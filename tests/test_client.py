@@ -171,6 +171,7 @@ class AccessClientTests(unittest.TestCase):
                 client.unlock_door(door_id="door-123")
 
         self.assertIn("HTTP 403", str(ctx.exception))
+        http_error.close()
 
     def test_network_error_is_wrapped(self):
         client = AccessClient(host="192.168.1.1", token="token-abc")
@@ -183,6 +184,23 @@ class AccessClientTests(unittest.TestCase):
                 client.unlock_door(door_id="door-123")
 
         self.assertIn("network error", str(ctx.exception))
+
+    def test_application_level_failure_is_wrapped(self):
+        client = AccessClient(host="192.168.1.1", token="token-abc")
+        with patch("gate_bridge.client.request.urlopen") as mocked:
+            mocked.return_value = FakeResponse(
+                '{"code":"FAILED","message":"relay unavailable"}'
+            )
+            with self.assertRaises(AccessApiError) as ctx:
+                client.unlock_door(door_id="door-123")
+        self.assertIn("relay unavailable", str(ctx.exception))
+
+    def test_non_object_json_is_rejected(self):
+        client = AccessClient(host="192.168.1.1", token="token-abc")
+        with patch("gate_bridge.client.request.urlopen") as mocked:
+            mocked.return_value = FakeResponse('["unexpected"]')
+            with self.assertRaises(AccessApiError):
+                client.list_doors()
 
 
 if __name__ == "__main__":

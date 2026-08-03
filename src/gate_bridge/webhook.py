@@ -13,13 +13,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Union
 from urllib.parse import parse_qs, urlparse
 
-from gate_bridge.activity import ActivityStore
+from gate_bridge.activity import ActivityEvent, ActivityStore, HoldWindow
 from gate_bridge.client import AccessApiError, AccessClient
 from gate_bridge.dashboard import (
     GateStatus,
     build_dashboard_state,
     build_gate_status,
-    render_dashboard_html,
+    load_dashboard_asset,
+    missing_dashboard_assets,
     render_dashboard_json,
 )
 
@@ -30,6 +31,10 @@ except ModuleNotFoundError:
 
 
 IpNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+KNOWN_CALLER_ACTIONS = frozenset({"open", "hold_open"})
+DTMF_ACTIONS = {"1": "open"}
+LEGACY_DASHBOARD_DB_PATH = "var/activity.sqlite3"
+STATE_DASHBOARD_DB_PATH = "/var/lib/phone-gate-bridge/activity.sqlite3"
 
 
 @dataclass(frozen=True)
@@ -55,7 +60,8 @@ class WebhookConfig:
         "192.168.0.0/16",
     )
     dashboard_recent_events_limit: int = 100
-    dashboard_db_path: str = "var/activity.sqlite3"
+    dashboard_db_path: str = STATE_DASHBOARD_DB_PATH
+    max_webhook_body_bytes: int = 16_384
 
 
 @dataclass(frozen=True)
@@ -64,6 +70,7 @@ class AllowedCaller:
     name: str = ""
     enabled: bool = True
     notes: str = ""
+    actions: tuple[str, ...] = ("open",)
 
 
 def normalize_phone(value: str) -> str:
@@ -97,12 +104,23 @@ def load_allowed_callers(path: str) -> tuple[AllowedCaller, ...]:
         enabled = bool(entry.get("enabled", True))
         name = str(entry.get("name", "")).strip()
         notes = str(entry.get("notes", "")).strip()
+        raw_actions = entry.get("actions", ["open"])
+        if not isinstance(raw_actions, list) or not all(
+            isinstance(action, str) for action in raw_actions
+        ):
+            raise ValueError(f"actions for caller '{number}' must be a list of strings")
+        actions = tuple(dict.fromkeys(action.strip() for action in raw_actions if action.strip()))
+        unknown_actions = sorted(set(actions) - KNOWN_CALLER_ACTIONS)
+        if unknown_actions:
+            names = ", ".join(unknown_actions)
+            raise ValueError(f"unknown actions for caller '{number}': {names}")
         callers.append(
             AllowedCaller(
                 number=number,
                 name=name,
                 enabled=enabled,
                 notes=notes,
+                actions=actions,
             )
         )
     return tuple(callers)
@@ -131,6 +149,13 @@ def _parse_simple_callers_toml(text: str) -> dict:
             current[k] = v[1:-1]
         elif v.lower() in {"true", "false"}:
             current[k] = v.lower() == "true"
+        elif v.startswith("[") and v.endswith("]"):
+            values = []
+            for item in v[1:-1].split(","):
+                cleaned = item.strip()
+                if cleaned.startswith('"') and cleaned.endswith('"'):
+                    values.append(cleaned[1:-1])
+            current[k] = values
         else:
             current[k] = v
 
@@ -174,6 +199,19 @@ def is_ip_allowed(ip_text: str, networks: tuple[IpNetwork, ...]) -> bool:
         if ip.version == network.version and ip in network:
             return True
     return False
+
+
+def resolve_dashboard_db_path(
+    configured: str | None,
+    *,
+    legacy_path: str = LEGACY_DASHBOARD_DB_PATH,
+) -> str:
+    """Choose a state path without hiding an existing installation's history."""
+    if configured is not None and configured.strip():
+        return configured.strip()
+    if os.path.isfile(legacy_path):
+        return legacy_path
+    return STATE_DASHBOARD_DB_PATH
 
 
 def twiml_say(message: str, voice: str = "Polly.Joanna-Neural") -> bytes:
@@ -258,6 +296,12 @@ def load_config_from_env() -> WebhookConfig:
     if not os.path.isfile(allowed_callers_file):
         raise ValueError(f"ALLOWED_CALLERS_FILE does not exist: {allowed_callers_file}")
     load_allowed_callers(allowed_callers_file)
+    recent_events_limit = int(os.getenv("DASHBOARD_RECENT_EVENTS_LIMIT", "100"))
+    if recent_events_limit <= 0:
+        raise ValueError("DASHBOARD_RECENT_EVENTS_LIMIT must be positive")
+    max_webhook_body_bytes = int(os.getenv("MAX_WEBHOOK_BODY_BYTES", "16384"))
+    if max_webhook_body_bytes <= 0:
+        raise ValueError("MAX_WEBHOOK_BODY_BYTES must be positive")
 
     return WebhookConfig(
         host=host,
@@ -277,8 +321,9 @@ def load_config_from_env() -> WebhookConfig:
         dashboard_allowed_cidrs=tuple(
             item.strip() for item in dashboard_allowed_cidrs.split(",") if item.strip()
         ),
-        dashboard_recent_events_limit=int(os.getenv("DASHBOARD_RECENT_EVENTS_LIMIT", "100")),
-        dashboard_db_path=os.getenv("DASHBOARD_DB_PATH", "var/activity.sqlite3"),
+        dashboard_recent_events_limit=recent_events_limit,
+        dashboard_db_path=resolve_dashboard_db_path(os.getenv("DASHBOARD_DB_PATH")),
+        max_webhook_body_bytes=max_webhook_body_bytes,
     )
 
 
@@ -326,7 +371,7 @@ class GateStatusProbe:
         self,
         *,
         last_unlock: ActivityEvent | None,
-        last_hold: ActivityEvent | None = None,
+        active_hold: HoldWindow | None = None,
     ) -> GateStatus:
         with self._lock:
             now = time.time()
@@ -340,7 +385,7 @@ class GateStatusProbe:
             door=door,
             door_error=error,
             last_unlock=last_unlock,
-            hold_started_at=last_hold.ts if last_hold is not None else None,
+            active_hold=active_hold,
         )
 
 
@@ -349,6 +394,7 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
     activity: ActivityStore
     dashboard_networks: tuple[IpNetwork, ...]
     gate_probe: GateStatusProbe
+    access_client_class = AccessClient
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -356,9 +402,9 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
             self._send_response(404, twiml_say("Not found.", self.config.twilio_tts_voice))
             return
 
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length).decode("utf-8", errors="replace")
-        form = parse_qs(body, keep_blank_values=True)
+        form = self._read_twilio_form()
+        if form is None:
+            return
         request_url = f"{self.config.public_base_url}{path}"
         signature = self.headers.get("X-Twilio-Signature")
         if not is_valid_twilio_signature(
@@ -372,14 +418,19 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
             return
 
         from_number = form.get("From", [""])[0]
-        call_sid = form.get("CallSid", [""])[0]
-        self.activity.record("twilio_request", detail=path, caller=from_number, call_sid=call_sid)
+        call_sid = form.get("CallSid", [""])[0].strip()
+        self.activity.record(
+            "twilio_request",
+            detail=path,
+            caller=from_number,
+            call_sid=call_sid,
+        )
         try:
             allowed_callers = load_allowed_callers(self.config.allowed_callers_file)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
             self.activity.record(
                 "allowed_callers_error",
-                detail=self.config.allowed_callers_file,
+                detail=str(exc),
                 caller=from_number,
                 call_sid=call_sid,
             )
@@ -417,7 +468,8 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
             return
 
         digit = form.get("Digits", [""])[0].strip()
-        if digit != "1":
+        action = DTMF_ACTIONS.get(digit)
+        if action is None:
             self.activity.record(
                 "invalid_digit",
                 detail=digit or "empty",
@@ -429,8 +481,73 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
                 twiml_say("Invalid selection. Goodbye.", self.config.twilio_tts_voice),
             )
             return
+        if action not in allowed_caller.actions:
+            self.activity.record(
+                "action_unauthorized",
+                detail=action,
+                caller=from_number,
+                call_sid=call_sid,
+            )
+            self._send_response(
+                200,
+                twiml_say(
+                    "This number is not authorized for that action.",
+                    self.config.twilio_tts_voice,
+                ),
+            )
+            return
 
-        client = AccessClient(
+        if action == "open":
+            self._perform_open(
+                caller=from_number,
+                call_sid=call_sid,
+                digit=digit,
+                allowed_caller=allowed_caller,
+            )
+            return
+
+        # Every advertised digit must have an implementation before it can be
+        # added to DTMF_ACTIONS. Fail closed if that invariant is broken.
+        self.activity.record(
+            "action_failed",
+            detail=f"unsupported action: {action}",
+            caller=from_number,
+            call_sid=call_sid,
+        )
+        self._send_response(
+            200,
+            twiml_say(
+                "That action is not available right now.",
+                self.config.twilio_tts_voice,
+            ),
+        )
+
+    def _read_twilio_form(self) -> dict[str, list[str]] | None:
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length or "0")
+        except ValueError:
+            self._send_plain(400, b"invalid content length")
+            return None
+        if length < 0:
+            self._send_plain(400, b"invalid content length")
+            return None
+        if length > self.config.max_webhook_body_bytes:
+            self._send_plain(413, b"request too large")
+            return None
+
+        content_type = self.headers.get("Content-Type", "")
+        if content_type and content_type.split(";", 1)[0].strip().lower() != (
+            "application/x-www-form-urlencoded"
+        ):
+            self._send_plain(415, b"unsupported media type")
+            return None
+
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        return parse_qs(body, keep_blank_values=True)
+
+    def _access_client(self) -> AccessClient:
+        return self.access_client_class(
             host=self.config.host,
             token=self.config.token,
             port=self.config.access_port,
@@ -438,35 +555,25 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
             verify_tls=self.config.verify_tls,
         )
 
+    def _perform_open(
+        self,
+        *,
+        caller: str,
+        call_sid: str,
+        digit: str,
+        allowed_caller: AllowedCaller,
+    ) -> None:
         try:
-            door_id = client.find_door_id(self.config.door_name)
-            client.unlock_door(
-                door_id=door_id,
-                actor_id=self.config.actor_id,
-                actor_name=self.config.actor_name,
-                extra={
-                    "source": "twilio-voice",
-                    "from": from_number,
-                    "call_sid": call_sid,
-                    "digit": digit,
-                    "caller_name": allowed_caller.name,
-                },
-            )
-            self._send_response(
-                200,
-                twiml_say("The gate is now open.", self.config.twilio_tts_voice),
-            )
-            self.activity.record(
-                "unlock_success",
-                detail=self.config.door_name,
-                caller=from_number,
+            attempt, created = self.activity.begin_action(
                 call_sid=call_sid,
+                action="open",
+                caller=caller,
             )
-        except (AccessApiError, ValueError):
+        except ValueError as exc:
             self.activity.record(
                 "unlock_failed",
-                detail=self.config.door_name,
-                caller=from_number,
+                detail=str(exc),
+                caller=caller,
                 call_sid=call_sid,
             )
             self._send_response(
@@ -476,35 +583,106 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
                     self.config.twilio_tts_voice,
                 ),
             )
+            return
+
+        if not created:
+            if attempt.status == "succeeded":
+                message = "The gate is now open."
+            elif attempt.status == "pending":
+                message = "This gate request is already being processed."
+            elif attempt.status == "unknown":
+                message = (
+                    "The previous gate request has an unknown result. "
+                    "Please check the gate before trying again."
+                )
+            else:
+                message = "Unable to open the gate right now. Please try again."
+            self._send_response(200, twiml_say(message, self.config.twilio_tts_voice))
+            return
+
+        client = self._access_client()
+        try:
+            door_id = client.find_door_id(self.config.door_name)
+            client.unlock_door(
+                door_id=door_id,
+                actor_id=self.config.actor_id,
+                actor_name=self.config.actor_name,
+                extra={
+                    "source": "twilio-voice",
+                    "from": caller,
+                    "call_sid": call_sid,
+                    "digit": digit,
+                    "caller_name": allowed_caller.name,
+                },
+            )
+        except (AccessApiError, ValueError) as exc:
+            self.activity.finish_action_with_event(
+                call_sid=call_sid,
+                action="open",
+                status="failed",
+                event="unlock_failed",
+                event_detail=str(exc),
+                caller=caller,
+            )
+            self._send_response(
+                200,
+                twiml_say(
+                    "Unable to open the gate right now. Please try again.",
+                    self.config.twilio_tts_voice,
+                ),
+            )
+            return
+
+        self.activity.finish_action_with_event(
+            call_sid=call_sid,
+            action="open",
+            status="succeeded",
+            event="unlock_success",
+            event_detail=self.config.door_name,
+            caller=caller,
+        )
+
+        # Record the durable outcome before writing to the caller. A dropped
+        # phone connection must not erase evidence that the gate moved.
+        self._send_response(
+            200,
+            twiml_say("The gate is now open.", self.config.twilio_tts_voice),
+        )
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path == "/healthz":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"ok")
+            self._send_plain(200, b"ok")
             return
-        if path in {"/dashboard", "/dashboard/api/state"}:
+        if path == "/dashboard" or path.startswith("/dashboard/"):
             remote_ip = self.client_address[0] if self.client_address else ""
             if not is_ip_allowed(remote_ip, self.dashboard_networks):
                 self.activity.record("dashboard_denied", detail=remote_ip)
                 self._send_plain(403, b"forbidden")
                 return
 
-            if path == "/dashboard":
+            if path in {"/dashboard", "/dashboard/"}:
                 # Only page loads are audited. The state endpoint is polled
                 # every few seconds and would bury the log.
                 self.activity.record("dashboard_view", detail=remote_ip)
 
-            state = self._dashboard_state()
-            if path == "/dashboard":
-                self._send_html(200, render_dashboard_html(state))
-            else:
+            if path == "/dashboard/api/state":
+                state = self._dashboard_state()
                 self._send_json(200, render_dashboard_json(state))
+                return
+
+            asset = load_dashboard_asset(path)
+            if asset is None:
+                self._send_plain(404, b"not found")
+                return
+            self._send_asset(
+                200,
+                body=asset.body,
+                content_type=asset.content_type,
+                cache_control=asset.cache_control,
+            )
             return
-        self.send_response(404)
-        self.end_headers()
+        self._send_plain(404, b"not found")
 
     def _dashboard_state(self):
         try:
@@ -518,7 +696,7 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
 
         gate = self.gate_probe.current(
             last_unlock=self.activity.latest(("unlock_success",)),
-            last_hold=self.activity.latest(("hold_open",)),
+            active_hold=self.activity.active_hold(),
         )
         return build_dashboard_state(
             store=self.activity,
@@ -535,6 +713,7 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/xml; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -542,14 +721,23 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_html(self, status: int, body: bytes) -> None:
+    def _send_asset(
+        self,
+        status: int,
+        *,
+        body: bytes,
+        content_type: str,
+        cache_control: str,
+    ) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache_control)
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -558,23 +746,44 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
+            "object-src 'none'; img-src 'self' data:; "
+            "style-src 'self' 'unsafe-inline'; script-src 'self'; "
+            "connect-src 'self'",
+        )
+
 
 def run_server(config: WebhookConfig) -> None:
+    missing_assets = missing_dashboard_assets()
+    if missing_assets:
+        paths = ", ".join(missing_assets)
+        raise RuntimeError(f"dashboard bundle is incomplete: {paths}")
     dashboard_networks = parse_cidr_list(",".join(config.dashboard_allowed_cidrs))
+    activity = ActivityStore(config.dashboard_db_path)
+    activity.recover_pending_actions()
     handler = type(
         "ConfiguredTwilioWebhookHandler",
         (TwilioWebhookHandler,),
         {
             "config": config,
-            "activity": ActivityStore(config.dashboard_db_path),
+            "activity": activity,
             "dashboard_networks": dashboard_networks,
             "gate_probe": GateStatusProbe(config),
         },
     )
     server = ThreadingHTTPServer((config.bind_host, config.bind_port), handler)
+    server.daemon_threads = True
     try:
         server.serve_forever()
     finally:

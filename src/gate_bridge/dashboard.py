@@ -1,94 +1,97 @@
-"""Admin dashboard: state assembly and rendering.
+"""Dashboard domain state, JSON contract, and compiled asset loading.
 
-The dashboard is read-only. It serves one HTML page plus a JSON state endpoint
-that the page polls, so the browser never needs a second round trip for assets.
+The browser UI lives in ``frontend/`` and is built into
+``gate_bridge/static/dashboard``. This module deliberately knows nothing about
+React or visual labels: it exposes semantic gate/activity data and serves the
+versioned frontend bundle.
 """
 
 from __future__ import annotations
 
 import json
+import mimetypes
+import re
 import time
-import xml.sax.saxutils as saxutils
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from gate_bridge.activity import ActivityEvent, ActivityStore
+from gate_bridge.activity import ActivityEvent, ActivityStore, HoldWindow
 
-STATIC_DIR = Path(__file__).parent / "static"
+SCHEMA_VERSION = 1
+DASHBOARD_DIR = Path(__file__).parent / "static" / "dashboard"
 
 # How long after an unlock pulse the gate is still shown as "opening". The
-# UniFi relay latches for a few seconds; this keeps the hero panel honest
-# without needing to poll the controller faster.
+# UniFi relay latches for a few seconds; this keeps the status honest without
+# needing to poll the controller faster.
 UNLOCK_PULSE_SECONDS = 12.0
 
 OPEN_EVENTS = ("unlock_success",)
-DENIED_EVENTS = ("caller_blocked", "signature_invalid", "dashboard_denied")
-ERROR_EVENTS = ("unlock_failed", "allowed_callers_error")
-
-# label, tone, group, icon id
-EVENT_META: dict[str, tuple[str, str, str, str]] = {
-    "unlock_success": ("Gate opened", "good", "opens", "unlock"),
-    "hold_open": ("Hold started", "warning", "opens", "timer"),
-    "hold_cleared": ("Hold cleared", "neutral", "opens", "timer"),
-    "caller_prompted": ("Caller prompted", "neutral", "calls", "phone"),
-    "twilio_request": ("Call received", "muted", "calls", "phone"),
-    "invalid_digit": ("No valid keypress", "warning", "calls", "keypad"),
-    "caller_blocked": ("Caller blocked", "serious", "denied", "shield"),
-    "signature_invalid": ("Invalid signature", "critical", "denied", "shield"),
-    "unlock_failed": ("Unlock failed", "critical", "errors", "alert"),
-    "allowed_callers_error": ("Allowlist unreadable", "critical", "errors", "alert"),
-    "dashboard_view": ("Dashboard opened", "muted", "system", "eye"),
-    "dashboard_denied": ("Dashboard blocked", "serious", "denied", "shield"),
+DENIED_EVENTS = (
+    "caller_blocked",
+    "signature_invalid",
+    "dashboard_denied",
+    "action_unauthorized",
+)
+ERROR_EVENTS = (
+    "unlock_failed",
+    "allowed_callers_error",
+    "action_failed",
+    "action_unknown",
+)
+_CALL_EVENT_PRIORITY = {
+    "twilio_request": 10,
+    "caller_prompted": 20,
+    "invalid_digit": 80,
+    "caller_blocked": 90,
+    "action_unauthorized": 90,
+    "unlock_failed": 100,
+    "action_failed": 100,
+    "action_unknown": 105,
+    "unlock_success": 110,
+    "hold_open": 110,
+    "hold_cleared": 110,
 }
 
 
 @dataclass(frozen=True)
 class GateStatus:
-    """Current physical state of the gate, as best we can determine it."""
+    """Physical gate signals plus any active control intent."""
 
     state: str = "unknown"  # secured | opening | open | held_open | unknown
-    mode: str = ""  # raw UniFi relay/position status
-    until: float | None = None
-    started_at: float | None = None
-    indefinite: bool = False
+    position: str = "unknown"  # open | closed | unknown
+    relay: str = "unknown"  # locked | unlocked | unknown
+    hold: HoldWindow | None = None
+    opening_expires_at: float | None = None
     available: bool = True
     error: str = ""
 
-    @property
-    def remaining(self) -> float | None:
-        if self.until is None:
-            return None
-        return max(0.0, self.until - time.time())
-
     def to_json(self) -> dict[str, Any]:
+        active_hold = None
+        if self.hold is not None:
+            active_hold = {
+                "started_at": self.hold.started_at,
+                "expires_at": self.hold.expires_at,
+                "caller": self.hold.caller,
+                "call_sid": self.hold.call_sid,
+            }
         return {
             "state": self.state,
-            "label": GATE_LABELS.get(self.state, "Unknown"),
-            "mode": self.mode,
-            "until": self.until,
-            "started_at": self.started_at,
-            "remaining": self.remaining,
-            "indefinite": self.indefinite,
+            "position": self.position,
+            "relay": self.relay,
+            "active_hold": active_hold,
+            "opening_expires_at": self.opening_expires_at,
             "available": self.available,
             "error": self.error,
         }
-
-
-GATE_LABELS = {
-    "secured": "Secured",
-    "opening": "Opening",
-    "open": "Open",
-    "held_open": "Held open",
-    "unknown": "Status unavailable",
-}
 
 
 @dataclass(frozen=True)
 class DashboardState:
     door_name: str
     gate: GateStatus
+    revision: int = 0
     stats: list[dict[str, Any]] = field(default_factory=list)
     chart: dict[str, Any] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -97,7 +100,9 @@ class DashboardState:
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "generated_at": self.generated_at,
+            "schema_version": SCHEMA_VERSION,
+            "server_time": self.generated_at,
+            "revision": self.revision,
             "door": self.door_name,
             "gate": self.gate.to_json(),
             "last_open": self.last_open,
@@ -107,31 +112,46 @@ class DashboardState:
         }
 
 
-def parse_door_status(door: dict[str, Any], now: float | None = None) -> GateStatus:
-    """Map a UniFi Access door record onto a gate state.
+@dataclass(frozen=True)
+class DashboardAsset:
+    body: bytes
+    content_type: str
+    cache_control: str
 
-    Two independent signals come back on the doors listing:
-    `door_position_status` is the physical sensor (`open`/`close`) and
-    `door_lock_relay_status` is the strike relay (`unlock`/`lock`). Position
-    wins when it says the gate is open, because a gate that has swung is open
-    regardless of what the relay has since done. Either field can be absent or
-    null on a door with no sensor or no hub, so a payload with no usable signal
-    reports `unknown` rather than claiming the gate is secured.
-    """
-    position = str(door.get("door_position_status") or "").strip().lower()
-    relay = str(door.get("door_lock_relay_status") or "").strip().lower()
+
+def parse_door_status(door: dict[str, Any], now: float | None = None) -> GateStatus:
+    """Map a UniFi Access door record onto normalized physical signals."""
+    del now  # Kept as an injectable argument for API compatibility and tests.
+    raw_position = str(door.get("door_position_status") or "").strip().lower()
+    raw_relay = str(door.get("door_lock_relay_status") or "").strip().lower()
+
+    position = {
+        "open": "open",
+        "close": "closed",
+        "closed": "closed",
+    }.get(raw_position, "unknown")
+    relay = {
+        "unlock": "unlocked",
+        "unlocked": "unlocked",
+        "lock": "locked",
+        "locked": "locked",
+    }.get(raw_relay, "unknown")
 
     if position == "open":
-        return GateStatus(state="open", mode=position)
-    if relay == "unlock":
-        return GateStatus(state="opening", mode=relay)
-    if relay == "lock" or position == "close":
-        return GateStatus(state="secured", mode=relay or position)
-    return GateStatus(
-        state="unknown",
-        available=False,
-        error="Door reported no lock or position status",
-    )
+        state = "open"
+    elif relay == "unlocked":
+        state = "opening"
+    elif relay == "locked" or position == "closed":
+        state = "secured"
+    else:
+        return GateStatus(
+            state="unknown",
+            position=position,
+            relay=relay,
+            available=False,
+            error="Door reported no lock or position status",
+        )
+    return GateStatus(state=state, position=position, relay=relay)
 
 
 def build_gate_status(
@@ -139,7 +159,7 @@ def build_gate_status(
     door: dict[str, Any] | None,
     door_error: str,
     last_unlock: ActivityEvent | None,
-    hold_started_at: float | None = None,
+    active_hold: HoldWindow | None = None,
     now: float | None = None,
 ) -> GateStatus:
     now = time.time() if now is None else now
@@ -152,62 +172,54 @@ def build_gate_status(
         )
     else:
         status = parse_door_status(door, now=now)
-        # The controller reports that the gate is released but not why. A hold
-        # is distinguished from a momentary pulse by the activity log, which
-        # also supplies the start time. No end time is available here, so the
-        # hold reads as indefinite.
-        if status.state in {"open", "opening"} and hold_started_at is not None:
-            status = GateStatus(
-                state="held_open",
-                mode=status.mode,
-                started_at=hold_started_at,
-                indefinite=True,
-            )
 
     # A momentary unlock can finish between polls, leaving no trace on the
-    # door record, so surface a recent pulse from the activity log instead.
+    # door record, so surface a recent successful pulse from the activity log.
     if status.state in {"secured", "unknown"} and last_unlock is not None:
-        if now - last_unlock.ts <= UNLOCK_PULSE_SECONDS:
-            return GateStatus(
+        if 0 <= now - last_unlock.ts <= UNLOCK_PULSE_SECONDS:
+            status = replace(
+                status,
                 state="opening",
-                mode=status.mode,
-                until=last_unlock.ts + UNLOCK_PULSE_SECONDS,
-                started_at=last_unlock.ts,
-                available=status.available,
-                error=status.error,
+                opening_expires_at=last_unlock.ts + UNLOCK_PULSE_SECONDS,
             )
+    elif status.state == "opening" and last_unlock is not None:
+        if 0 <= now - last_unlock.ts <= UNLOCK_PULSE_SECONDS:
+            status = replace(
+                status,
+                opening_expires_at=last_unlock.ts + UNLOCK_PULSE_SECONDS,
+            )
+
+    # Hold intent is separate from the physical signals. Only call the gate
+    # held-open when a finite, uncleared hold overlaps an open/opening signal.
+    if active_hold is not None and active_hold.expires_at > now:
+        if status.state in {"open", "opening"}:
+            status = replace(status, state="held_open", hold=active_hold)
     return status
 
 
 def _describe_caller(number: str, caller_names: dict[str, str]) -> str:
-    if not number:
-        return ""
-    return caller_names.get(number, "")
+    return caller_names.get(number, "") if number else ""
 
 
-def _format_detail(event: str, detail: str) -> str:
-    value = detail.strip()
-    if event == "hold_open" and value.isdigit():
-        return f"{value} min hold"
-    if event == "invalid_digit":
-        return f"pressed {value}" if value and value != "empty" else "no keypress"
-    return detail
+def _event_id(item: ActivityEvent) -> str:
+    if item.call_sid:
+        return f"call:{item.call_sid}"
+    if item.id:
+        return f"event:{item.id}"
+    # Only synthetic/unit-test events lack a database id.
+    return f"event:legacy:{item.ts}:{item.event}:{item.caller}"
 
 
 def _event_json(item: ActivityEvent, caller_names: dict[str, str]) -> dict[str, Any]:
-    label, tone, group, icon = EVENT_META.get(
-        item.event, (item.event.replace("_", " ").capitalize(), "muted", "system", "dot")
-    )
     return {
+        "id": _event_id(item),
+        "raw_id": item.id,
         "ts": item.ts,
         "event": item.event,
-        "label": label,
-        "tone": tone,
-        "group": group,
-        "icon": icon,
         "caller": item.caller,
         "name": _describe_caller(item.caller, caller_names),
-        "detail": _format_detail(item.event, item.detail),
+        "detail": item.detail,
+        "data": item.data,
         "call_sid": item.call_sid,
         "steps": [],
         "count": 1,
@@ -217,40 +229,56 @@ def _event_json(item: ActivityEvent, caller_names: dict[str, str]) -> dict[str, 
 def group_events(
     recent: list[ActivityEvent], caller_names: dict[str, str]
 ) -> list[dict[str, Any]]:
-    """Collapse one phone call into a single row.
+    """Collapse the activity rows for one Twilio call into one stable entry.
 
-    A single call writes several rows (`twilio_request`, `caller_prompted`,
-    `unlock_success`), which makes the raw log unreadable. Events sharing a
-    Twilio call SID become one entry headlined by the call's outcome — the
-    newest event, since the terminal one is always written last — with the
-    earlier steps kept on the entry rather than discarded.
-
-    `recent` must be newest-first.
+    ``recent`` must be newest-first. A row keeps the same ``call:<CallSid>`` id
+    while the call advances from received to prompted to its final outcome, so
+    React can update it in place instead of replacing the DOM node.
     """
-    grouped: list[dict[str, Any]] = []
-    by_sid: dict[str, dict[str, Any]] = {}
+    grouped: list[dict[str, Any] | list[ActivityEvent]] = []
+    by_sid: dict[str, list[ActivityEvent]] = {}
 
     for item in recent:
         if not item.call_sid:
             grouped.append(_event_json(item, caller_names))
             continue
 
-        existing = by_sid.get(item.call_sid)
-        if existing is None:
-            entry = _event_json(item, caller_names)
-            by_sid[item.call_sid] = entry
-            grouped.append(entry)
+        items = by_sid.get(item.call_sid)
+        if items is None:
+            items = []
+            by_sid[item.call_sid] = items
+            grouped.append(items)
+        items.append(item)
+
+    result: list[dict[str, Any]] = []
+    for entry in grouped:
+        if isinstance(entry, dict):
+            result.append(entry)
             continue
 
-        label = EVENT_META.get(item.event, (item.event, "", "", ""))[0]
-        existing["steps"].insert(0, label)
-        existing["count"] += 1
-        if not existing["name"]:
-            existing["name"] = _describe_caller(item.caller, caller_names)
-        if not existing["caller"]:
-            existing["caller"] = item.caller
-
-    return grouped
+        # Twilio may retry a callback after its first delivery succeeded. The
+        # newest raw row can therefore be another `twilio_request`; choose the
+        # strongest outcome rather than assuming the last row is terminal.
+        outcome = max(
+            entry,
+            key=lambda item: (
+                _CALL_EVENT_PRIORITY.get(item.event, 60),
+                item.id,
+                item.ts,
+            ),
+        )
+        rendered = _event_json(outcome, caller_names)
+        rendered["steps"] = [
+            item.event for item in reversed(entry) if item is not outcome
+        ]
+        rendered["count"] = len(entry)
+        for item in entry:
+            if not rendered["name"]:
+                rendered["name"] = _describe_caller(item.caller, caller_names)
+            if not rendered["caller"]:
+                rendered["caller"] = item.caller
+        result.append(rendered)
+    return result
 
 
 def build_dashboard_state(
@@ -267,9 +295,9 @@ def build_dashboard_state(
     midnight = now - (local.tm_hour * 3600 + local.tm_min * 60 + local.tm_sec)
     week_ago = now - 7 * 86400
 
-    counts, recent = store.snapshot(recent_limit)
+    _, recent = store.snapshot(recent_limit)
     buckets = store.hourly_histogram(OPEN_EVENTS, hours=24, now=now)
-    bucket_counts = [b.count for b in buckets]
+    bucket_counts = [bucket.count for bucket in buckets]
 
     last_unlock = store.latest(OPEN_EVENTS)
     last_open = None
@@ -284,42 +312,35 @@ def build_dashboard_state(
     stats = [
         {
             "key": "opens_today",
-            "label": "Opens today",
             "value": store.count_since(OPEN_EVENTS, midnight),
-            "tone": "neutral",
         },
         {
             "key": "opens_week",
-            "label": "Opens this week",
             "value": store.count_since(OPEN_EVENTS, week_ago),
-            "tone": "neutral",
         },
         {
             "key": "callers_week",
-            "label": "Callers this week",
             "value": store.distinct_callers_since(OPEN_EVENTS, week_ago),
-            "tone": "neutral",
         },
         {
             "key": "denied_week",
-            "label": "Denied this week",
             "value": store.count_since(DENIED_EVENTS, week_ago),
-            "tone": "serious",
         },
         {
             "key": "errors_week",
-            "label": "Failures this week",
             "value": store.count_since(ERROR_EVENTS, week_ago),
-            "tone": "critical",
         },
     ]
 
     return DashboardState(
         door_name=door_name,
         gate=gate,
+        revision=store.latest_id(),
         stats=stats,
         chart={
-            "buckets": [{"start": b.start, "count": b.count} for b in buckets],
+            "buckets": [
+                {"start": bucket.start, "count": bucket.count} for bucket in buckets
+            ],
             "max": max(bucket_counts) if bucket_counts else 0,
             "total": sum(bucket_counts),
         },
@@ -329,137 +350,67 @@ def build_dashboard_state(
     )
 
 
-@lru_cache(maxsize=4)
-def _asset(name: str) -> str:
-    return (STATIC_DIR / name).read_text(encoding="utf-8")
-
-
-ICON_SPRITE = """
-<svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
-<defs>
-<symbol id="i-unlock" viewBox="0 0 24 24"><path d="M7 11V7a5 5 0 0 1 9.9-1M5 11h14v10H5z"/></symbol>
-<symbol id="i-timer" viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/></symbol>
-<symbol id="i-phone" viewBox="0 0 24 24"><path d="M6.5 3h3l1.5 4.5-2 1.5a12 12 0 0 0 6 6l1.5-2 4.5 1.5v3a2 2 0 0 1-2.2 2A17 17 0 0 1 4.5 5.2 2 2 0 0 1 6.5 3z"/></symbol>
-<symbol id="i-keypad" viewBox="0 0 24 24"><circle cx="6" cy="6" r="1.4"/><circle cx="12" cy="6" r="1.4"/><circle cx="18" cy="6" r="1.4"/><circle cx="6" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="18" cy="12" r="1.4"/><circle cx="12" cy="18" r="1.4"/></symbol>
-<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.5-3 7.7-7 9-4-1.3-7-4.5-7-9V6z"/><path d="M12 9v4M12 16h.01"/></symbol>
-<symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4l9 15H3z"/><path d="M12 10v4M12 16.5h.01"/></symbol>
-<symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="2.5"/></symbol>
-<symbol id="i-dot" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/></symbol>
-<symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></symbol>
-<symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></symbol>
-</defs>
-</svg>
-""".strip()
-
-
-def render_dashboard_html(state: DashboardState) -> bytes:
-    title = f"{state.door_name} — Gate Control"
-    bootstrap = json.dumps(state.to_json(), separators=(",", ":"))
-    # Guard against a literal </script> inside serialized detail text.
-    bootstrap = bootstrap.replace("</", "<\\/")
-
-    html = f"""<!doctype html>
-<html lang="en" data-state="{saxutils.escape(state.gate.state)}">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="dark light">
-<title>{saxutils.escape(title)}</title>
-<style>{_asset('dashboard.css')}</style>
-</head>
-<body>
-{ICON_SPRITE}
-<div class="glow" aria-hidden="true"></div>
-
-<header class="topbar">
-  <div class="brand">
-    <span class="brand-mark" aria-hidden="true"></span>
-    <span class="brand-text">
-      <strong>{saxutils.escape(state.door_name)}</strong>
-      <span>Phone Gate Bridge</span>
-    </span>
-  </div>
-  <div class="topbar-actions">
-    <p class="live" id="live" data-status="live">
-      <span class="live-dot" aria-hidden="true"></span>
-      <span class="live-text">Live</span>
-    </p>
-    <button class="icon-button" id="theme-toggle" type="button" aria-label="Switch theme">
-      <svg class="only-dark" aria-hidden="true"><use href="#i-sun"/></svg>
-      <svg class="only-light" aria-hidden="true"><use href="#i-moon"/></svg>
-    </button>
-  </div>
-</header>
-
-<main>
-  <section class="hero" id="hero" aria-labelledby="hero-state">
-    <div class="hero-body">
-      <p class="hero-eyebrow">
-        <span class="state-dot" aria-hidden="true"></span>
-        <span id="hero-mode">Gate status</span>
-      </p>
-      <h1 class="hero-state" id="hero-state">Secured</h1>
-      <p class="hero-note" id="hero-note"></p>
-      <dl class="hero-meta" id="hero-meta"></dl>
-    </div>
-    <div class="hero-dial" id="hero-dial" data-visible="false">
-      <div class="ring" id="ring">
-        <div class="ring-inner">
-          <span class="ring-value" id="ring-value">—</span>
-          <span class="ring-unit" id="ring-unit">remaining</span>
-        </div>
-      </div>
-      <p class="ring-caption" id="ring-caption"></p>
-    </div>
-  </section>
-
-  <section class="stats" id="stats" aria-label="Summary"></section>
-
-  <section class="panel chart-panel" aria-labelledby="chart-title">
-    <header class="panel-head">
-      <div>
-        <h2 id="chart-title">Gate opens</h2>
-        <p class="panel-sub">Last 24 hours &middot; <span id="chart-total">0</span> total</p>
-      </div>
-    </header>
-    <figure class="chart" id="chart">
-      <div class="chart-plot" id="chart-plot" role="img" aria-describedby="chart-table-note"></div>
-      <figcaption class="chart-axis" id="chart-axis"></figcaption>
-    </figure>
-    <p class="visually-hidden" id="chart-table-note"></p>
-  </section>
-
-  <section class="panel" aria-labelledby="feed-title">
-    <header class="panel-head">
-      <div>
-        <h2 id="feed-title">Activity</h2>
-        <p class="panel-sub"><span id="feed-count">0</span> events shown</p>
-      </div>
-      <div class="chips" id="filters" role="group" aria-label="Filter activity">
-        <button type="button" class="chip" data-filter="all" aria-pressed="true">All</button>
-        <button type="button" class="chip" data-filter="opens" aria-pressed="false">Opens</button>
-        <button type="button" class="chip" data-filter="denied" aria-pressed="false">Denied</button>
-        <button type="button" class="chip" data-filter="errors" aria-pressed="false">Errors</button>
-      </div>
-    </header>
-    <ol class="feed" id="feed"></ol>
-    <p class="empty" id="feed-empty" hidden>Nothing here yet.</p>
-  </section>
-</main>
-
-<footer class="foot">
-  <span>Read-only &middot; local networks only</span>
-  <span id="updated">—</span>
-</footer>
-
-<div class="tooltip" id="tooltip" role="status" aria-live="off" hidden></div>
-
-<script type="application/json" id="bootstrap">{bootstrap}</script>
-<script type="module">{_asset('dashboard.js')}</script>
-</body>
-</html>"""
-    return html.encode("utf-8")
-
-
 def render_dashboard_json(state: DashboardState) -> bytes:
     return json.dumps(state.to_json(), separators=(",", ":")).encode("utf-8")
+
+
+@lru_cache(maxsize=64)
+def load_dashboard_asset(request_path: str) -> DashboardAsset | None:
+    """Load a safe path from the compiled Vite bundle."""
+    if request_path in {"/dashboard", "/dashboard/"}:
+        relative = PurePosixPath("index.html")
+    elif request_path.startswith("/dashboard/"):
+        relative = PurePosixPath(request_path.removeprefix("/dashboard/"))
+    else:
+        return None
+
+    if (
+        not relative.parts
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or relative.parts[0] == "api"
+    ):
+        return None
+
+    candidate = DASHBOARD_DIR.joinpath(*relative.parts)
+    try:
+        candidate.resolve().relative_to(DASHBOARD_DIR.resolve())
+    except ValueError:
+        return None
+    if not candidate.is_file():
+        return None
+
+    guessed, _ = mimetypes.guess_type(candidate.name)
+    content_type = guessed or "application/octet-stream"
+    if content_type.startswith("text/") or content_type in {
+        "application/javascript",
+        "application/json",
+        "image/svg+xml",
+    }:
+        content_type = f"{content_type}; charset=utf-8"
+    cache_control = (
+        "no-store"
+        if relative == PurePosixPath("index.html")
+        else "public, max-age=31536000, immutable"
+    )
+    return DashboardAsset(
+        body=candidate.read_bytes(),
+        content_type=content_type,
+        cache_control=cache_control,
+    )
+
+
+_ASSET_REFERENCE = re.compile(rb"""(?:src|href)=["'](/dashboard/[^"'?#]+)""")
+
+
+def missing_dashboard_assets() -> list[str]:
+    """Return Vite index references that are absent from the package."""
+    index = DASHBOARD_DIR / "index.html"
+    if not index.is_file():
+        return ["/dashboard/index.html"]
+    missing = []
+    for raw_path in _ASSET_REFERENCE.findall(index.read_bytes()):
+        path = raw_path.decode("utf-8")
+        if load_dashboard_asset(path) is None:
+            missing.append(path)
+    return sorted(set(missing))

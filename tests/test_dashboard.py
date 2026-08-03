@@ -1,56 +1,59 @@
 import json
+import sqlite3
 import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from gate_bridge.activity import ActivityEvent, ActivityStore
+from gate_bridge.activity import ActivityEvent, ActivityStore, HoldWindow
 from gate_bridge.dashboard import (
     GateStatus,
     build_dashboard_state,
     build_gate_status,
     group_events,
+    load_dashboard_asset,
+    missing_dashboard_assets,
     parse_door_status,
-    render_dashboard_html,
     render_dashboard_json,
 )
 
 NOW = 1_700_000_000.0
-
 SECURED = {"door_position_status": "close", "door_lock_relay_status": "lock"}
 
 
 class DoorStatusTests(unittest.TestCase):
     def test_closed_and_locked_is_secured(self):
-        self.assertEqual(parse_door_status(SECURED, now=NOW).state, "secured")
+        status = parse_door_status(SECURED, now=NOW)
+        self.assertEqual(status.state, "secured")
+        self.assertEqual(status.position, "closed")
+        self.assertEqual(status.relay, "locked")
 
-    def test_open_position_is_open(self):
+    def test_open_position_wins_over_relock(self):
         status = parse_door_status(
-            {"door_position_status": "open", "door_lock_relay_status": "lock"}, now=NOW
+            {"door_position_status": "open", "door_lock_relay_status": "lock"},
+            now=NOW,
         )
         self.assertEqual(status.state, "open")
-
-    def test_position_wins_over_relock(self):
-        # The relay can re-latch while the gate is still swung open; the
-        # physical sensor is the truth.
-        status = parse_door_status(
-            {"door_position_status": "open", "door_lock_relay_status": "lock"}, now=NOW
-        )
-        self.assertEqual(status.state, "open")
+        self.assertEqual(status.position, "open")
+        self.assertEqual(status.relay, "locked")
 
     def test_released_relay_is_opening(self):
         status = parse_door_status(
-            {"door_position_status": "close", "door_lock_relay_status": "unlock"}, now=NOW
+            {"door_position_status": "close", "door_lock_relay_status": "unlock"},
+            now=NOW,
         )
         self.assertEqual(status.state, "opening")
+        self.assertEqual(status.relay, "unlocked")
 
-    def test_relay_only_door_still_reports(self):
-        status = parse_door_status({"door_lock_relay_status": "lock"}, now=NOW)
-        self.assertEqual(status.state, "secured")
-
-    def test_position_only_door_still_reports(self):
-        status = parse_door_status({"door_position_status": "close"}, now=NOW)
-        self.assertEqual(status.state, "secured")
+    def test_single_signal_still_reports(self):
+        self.assertEqual(
+            parse_door_status({"door_lock_relay_status": "lock"}, now=NOW).state,
+            "secured",
+        )
+        self.assertEqual(
+            parse_door_status({"door_position_status": "close"}, now=NOW).state,
+            "secured",
+        )
 
     def test_no_usable_signal_is_unknown(self):
         for payload in ({}, {"door_position_status": None, "door_lock_relay_status": None}):
@@ -61,9 +64,23 @@ class DoorStatusTests(unittest.TestCase):
 
 class GateStatusTests(unittest.TestCase):
     def _unlock(self, ts):
-        return ActivityEvent(ts=ts, event="unlock_success", detail="Gate", caller="+1", call_sid="CA")
+        return ActivityEvent(
+            ts=ts,
+            event="unlock_success",
+            detail="Gate",
+            caller="+1",
+            call_sid="CA",
+        )
 
-    def test_recent_unlock_shows_opening(self):
+    def _hold(self, *, expires_at=NOW + 1_800):
+        return HoldWindow(
+            started_at=NOW - 200,
+            expires_at=expires_at,
+            caller="+1",
+            call_sid="CA",
+        )
+
+    def test_recent_unlock_shows_timed_opening(self):
         status = build_gate_status(
             door=SECURED,
             door_error="",
@@ -71,6 +88,7 @@ class GateStatusTests(unittest.TestCase):
             now=NOW,
         )
         self.assertEqual(status.state, "opening")
+        self.assertEqual(status.opening_expires_at, NOW + 9)
 
     def test_old_unlock_does_not_show_opening(self):
         status = build_gate_status(
@@ -90,157 +108,334 @@ class GateStatusTests(unittest.TestCase):
         )
         self.assertEqual(status.state, "open")
 
-    def test_hold_wins_over_recent_unlock(self):
+    def test_active_hold_is_finite_and_separate_from_physical_signals(self):
+        hold = self._hold()
         status = build_gate_status(
             door={"door_position_status": "open", "door_lock_relay_status": "unlock"},
             door_error="",
             last_unlock=self._unlock(NOW - 1),
-            hold_started_at=NOW - 200,
+            active_hold=hold,
             now=NOW,
         )
         self.assertEqual(status.state, "held_open")
-        self.assertEqual(status.started_at, NOW - 200)
-        self.assertTrue(status.indefinite)
+        self.assertEqual(status.hold, hold)
+        self.assertEqual(status.position, "open")
+        self.assertEqual(status.relay, "unlocked")
 
-    def test_hold_ignored_while_gate_is_secured(self):
-        status = build_gate_status(
+    def test_expired_or_physically_secured_hold_is_not_shown(self):
+        secured = build_gate_status(
             door=SECURED,
             door_error="",
             last_unlock=None,
-            hold_started_at=NOW - 200,
+            active_hold=self._hold(),
             now=NOW,
         )
-        self.assertEqual(status.state, "secured")
+        expired = build_gate_status(
+            door={"door_position_status": "open"},
+            door_error="",
+            last_unlock=None,
+            active_hold=self._hold(expires_at=NOW),
+            now=NOW,
+        )
+        self.assertEqual(secured.state, "secured")
+        self.assertEqual(expired.state, "open")
 
-    def test_unreadable_door_reports_unknown(self):
-        status = build_gate_status(
+    def test_unreadable_door_reports_unknown_but_recent_unlock_surfaces(self):
+        unknown = build_gate_status(
             door=None,
             door_error="Access API timeout",
             last_unlock=None,
             now=NOW,
         )
-        self.assertEqual(status.state, "unknown")
-        self.assertFalse(status.available)
-        self.assertIn("timeout", status.error)
-
-    def test_unreadable_door_still_shows_recent_unlock(self):
-        status = build_gate_status(
+        opening = build_gate_status(
             door=None,
             door_error="Access API timeout",
             last_unlock=self._unlock(NOW - 2),
             now=NOW,
         )
-        self.assertEqual(status.state, "opening")
+        self.assertEqual(unknown.state, "unknown")
+        self.assertFalse(unknown.available)
+        self.assertIn("timeout", unknown.error)
+        self.assertEqual(opening.state, "opening")
 
 
-class HistogramTests(unittest.TestCase):
-    def test_buckets_span_requested_hours_and_count_in_window(self):
+class ActivityStoreTests(unittest.TestCase):
+    def test_existing_database_migrates_without_losing_rows(self):
         with TemporaryDirectory() as tmp:
-            store = ActivityStore(str(Path(tmp) / "a.sqlite3"))
+            path = Path(tmp) / "activity.sqlite3"
+            conn = sqlite3.connect(path)
+            conn.execute(
+                """
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    event TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    caller TEXT NOT NULL,
+                    call_sid TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO events (ts, event, detail, caller, call_sid) "
+                "VALUES (?, 'unlock_success', 'Gate', '+1', 'CA-old')",
+                (NOW,),
+            )
+            conn.commit()
+            conn.close()
+
+            store = ActivityStore(str(path))
+            _, recent = store.snapshot(10)
+            self.assertEqual(recent[0].call_sid, "CA-old")
+            self.assertEqual(recent[0].id, 1)
+            self.assertEqual(recent[0].data, {})
+
+    def test_record_returns_stable_id_and_structured_data(self):
+        with TemporaryDirectory() as tmp:
+            store = ActivityStore(str(Path(tmp) / "activity.sqlite3"))
+            item = store.record("custom", data={"answer": 42})
+            _, recent = store.snapshot(10)
+            self.assertGreater(item.id, 0)
+            self.assertEqual(recent[0].id, item.id)
+            self.assertEqual(recent[0].data, {"answer": 42})
+
+    def test_hold_lifecycle_obeys_clear_and_expiry(self):
+        with TemporaryDirectory() as tmp:
+            store = ActivityStore(str(Path(tmp) / "activity.sqlite3"))
+            store.record_hold_open(duration_seconds=1_800, caller="+1", at=NOW)
+            hold = store.active_hold(now=NOW + 1)
+            self.assertIsNotNone(hold)
+            self.assertEqual(hold.expires_at, NOW + 1_800)
+            self.assertIsNone(store.active_hold(now=NOW + 1_800))
+
+            store.record_hold_open(duration_seconds=1_800, caller="+1", at=NOW + 2_000)
+            store.record_hold_cleared(caller="+1", reason="manual", at=NOW + 2_100)
+            self.assertIsNone(store.active_hold(now=NOW + 2_200))
+
+    def test_legacy_hold_minutes_remain_readable(self):
+        with TemporaryDirectory() as tmp:
+            store = ActivityStore(str(Path(tmp) / "activity.sqlite3"))
+            store.record("hold_open", detail="30", at=NOW)
+            hold = store.active_hold(now=NOW + 1)
+            self.assertIsNotNone(hold)
+            self.assertEqual(hold.expires_at, NOW + 1_800)
+
+    def test_actions_are_reserved_once_and_finished_once(self):
+        with TemporaryDirectory() as tmp:
+            store = ActivityStore(str(Path(tmp) / "activity.sqlite3"))
+            first, created = store.begin_action(
+                call_sid="CA1",
+                action="open",
+                caller="+1",
+                at=NOW,
+            )
+            duplicate, duplicate_created = store.begin_action(
+                call_sid="CA1",
+                action="open",
+                caller="+1",
+                at=NOW + 1,
+            )
+            self.assertTrue(created)
+            self.assertFalse(duplicate_created)
+            self.assertEqual(first.status, "pending")
+            self.assertEqual(duplicate.requested_at, NOW)
+
+            finished = store.finish_action(
+                call_sid="CA1",
+                action="open",
+                status="succeeded",
+                at=NOW + 2,
+            )
+            self.assertEqual(finished.status, "succeeded")
+            with self.assertRaises(ValueError):
+                store.finish_action(
+                    call_sid="CA1",
+                    action="open",
+                    status="failed",
+                )
+
+    def test_action_result_and_activity_event_commit_together(self):
+        with TemporaryDirectory() as tmp:
+            store = ActivityStore(str(Path(tmp) / "activity.sqlite3"))
+            store.begin_action(
+                call_sid="CA-atomic",
+                action="open",
+                caller="+1",
+                at=NOW,
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.finish_action_with_event(
+                    call_sid="CA-atomic",
+                    action="open",
+                    status="succeeded",
+                    event=None,  # type: ignore[arg-type]
+                    caller="+1",
+                    at=NOW + 0.5,
+                )
+            pending, created = store.begin_action(
+                call_sid="CA-atomic",
+                action="open",
+                caller="+1",
+                at=NOW + 0.75,
+            )
+            self.assertFalse(created)
+            self.assertEqual(pending.status, "pending")
+
+            attempt, event = store.finish_action_with_event(
+                call_sid="CA-atomic",
+                action="open",
+                status="succeeded",
+                event="unlock_success",
+                event_detail="Gate",
+                caller="+1",
+                at=NOW + 1,
+            )
+
+            counts, recent = store.snapshot(10)
+            self.assertEqual(attempt.status, "succeeded")
+            self.assertEqual(event.id, recent[0].id)
+            self.assertEqual(counts["unlock_success"], 1)
+
+    def test_pending_action_becomes_unknown_after_restart_recovery(self):
+        with TemporaryDirectory() as tmp:
+            store = ActivityStore(str(Path(tmp) / "activity.sqlite3"))
+            store.begin_action(
+                call_sid="CA-interrupted",
+                action="open",
+                caller="+1",
+                at=NOW,
+            )
+
+            recovered = store.recover_pending_actions(at=NOW + 10)
+            attempt, created = store.begin_action(
+                call_sid="CA-interrupted",
+                action="open",
+                caller="+1",
+                at=NOW + 11,
+            )
+            counts, recent = store.snapshot(10)
+
+            self.assertEqual(recovered, 1)
+            self.assertFalse(created)
+            self.assertEqual(attempt.status, "unknown")
+            self.assertEqual(counts["action_unknown"], 1)
+            self.assertEqual(recent[0].call_sid, "CA-interrupted")
+
+    def test_histogram_counts_and_distinct_callers(self):
+        with TemporaryDirectory() as tmp:
+            store = ActivityStore(str(Path(tmp) / "activity.sqlite3"))
             now = time.time()
-            for _ in range(3):
-                store.record("unlock_success")
-            buckets = store.hourly_histogram(("unlock_success",), hours=24, now=now)
-            self.assertEqual(len(buckets), 24)
-            self.assertEqual(sum(b.count for b in buckets), 3)
-            self.assertEqual(buckets[-1].count, 3)
-
-    def test_counts_and_distinct_callers(self):
-        with TemporaryDirectory() as tmp:
-            store = ActivityStore(str(Path(tmp) / "a.sqlite3"))
             store.record("unlock_success", caller="+17075551111")
             store.record("unlock_success", caller="+17075551111")
             store.record("unlock_success", caller="+17075552222")
             store.record("caller_blocked", caller="+17075559999")
-            since = time.time() - 3600
-            self.assertEqual(store.count_since(("unlock_success",), since), 3)
-            self.assertEqual(store.distinct_callers_since(("unlock_success",), since), 2)
-            self.assertEqual(store.latest(("unlock_success",)).caller, "+17075552222")
-            self.assertIsNone(store.latest(("hold_open",)))
+            buckets = store.hourly_histogram(("unlock_success",), hours=24, now=now)
+            self.assertEqual(len(buckets), 24)
+            self.assertEqual(sum(bucket.count for bucket in buckets), 3)
+            self.assertEqual(
+                store.distinct_callers_since(("unlock_success",), now - 3_600),
+                2,
+            )
 
 
 class GroupEventsTests(unittest.TestCase):
-    def _ev(self, ts, event, sid="", caller="+17075551111", detail=""):
-        return ActivityEvent(ts=ts, event=event, detail=detail, caller=caller, call_sid=sid)
+    def _event(self, row_id, ts, event, sid="", caller="+17075551111", detail=""):
+        return ActivityEvent(
+            id=row_id,
+            ts=ts,
+            event=event,
+            detail=detail,
+            caller=caller,
+            call_sid=sid,
+        )
 
-    def test_one_call_collapses_to_its_outcome(self):
-        # newest first, as snapshot() returns
+    def test_one_call_collapses_to_stable_call_identity(self):
         recent = [
-            self._ev(NOW + 2, "unlock_success", "CA1", detail="Gate"),
-            self._ev(NOW + 1, "caller_prompted", "CA1"),
-            self._ev(NOW, "twilio_request", "CA1", detail="/twilio/voice"),
+            self._event(3, NOW + 2, "unlock_success", "CA1", detail="Gate"),
+            self._event(2, NOW + 1, "caller_prompted", "CA1"),
+            self._event(1, NOW, "twilio_request", "CA1", detail="/twilio/voice"),
         ]
         rows = group_events(recent, {"+17075551111": "Oren"})
         self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "call:CA1")
         self.assertEqual(rows[0]["event"], "unlock_success")
         self.assertEqual(rows[0]["count"], 3)
-        self.assertEqual(rows[0]["steps"], ["Call received", "Caller prompted"])
+        self.assertEqual(rows[0]["steps"], ["twilio_request", "caller_prompted"])
         self.assertEqual(rows[0]["name"], "Oren")
 
-    def test_separate_calls_stay_separate(self):
+    def test_non_call_events_use_database_identity(self):
         recent = [
-            self._ev(NOW + 3, "unlock_success", "CA2"),
-            self._ev(NOW + 2, "caller_prompted", "CA2"),
-            self._ev(NOW + 1, "caller_blocked", "CA1"),
+            self._event(8, NOW + 1, "dashboard_view", detail="10.0.0.5"),
+            self._event(7, NOW, "dashboard_view", detail="10.0.0.6"),
         ]
         rows = group_events(recent, {})
-        self.assertEqual([r["event"] for r in rows], ["unlock_success", "caller_blocked"])
+        self.assertEqual([row["id"] for row in rows], ["event:8", "event:7"])
 
-    def test_events_without_a_call_sid_are_not_merged(self):
+    def test_retry_after_success_does_not_replace_the_call_outcome(self):
         recent = [
-            self._ev(NOW + 1, "dashboard_view", caller="", detail="10.0.0.5"),
-            self._ev(NOW, "dashboard_view", caller="", detail="10.0.0.6"),
+            self._event(4, NOW + 3, "twilio_request", "CA1"),
+            self._event(3, NOW + 2, "unlock_success", "CA1"),
+            self._event(2, NOW + 1, "caller_prompted", "CA1"),
+            self._event(1, NOW, "twilio_request", "CA1"),
         ]
-        self.assertEqual(len(group_events(recent, {})), 2)
-
-    def test_hold_duration_is_formatted(self):
-        rows = group_events([self._ev(NOW, "hold_open", "CA9", detail="45")], {})
-        self.assertEqual(rows[0]["detail"], "45 min hold")
+        row = group_events(recent, {})[0]
+        self.assertEqual(row["event"], "unlock_success")
+        self.assertEqual(row["id"], "call:CA1")
 
 
-class RenderTests(unittest.TestCase):
+class ContractAndAssetTests(unittest.TestCase):
     def _state(self):
         with TemporaryDirectory() as tmp:
-            store = ActivityStore(str(Path(tmp) / "a.sqlite3"))
-            store.record("unlock_success", detail="Gate", caller="+17075551111", call_sid="CA1")
+            store = ActivityStore(str(Path(tmp) / "activity.sqlite3"))
+            store.record(
+                "unlock_success",
+                detail="Gate",
+                caller="+17075551111",
+                call_sid="CA1",
+            )
             store.record("caller_blocked", caller="+17075559999")
+            store.record("action_unauthorized", caller="+17075558888")
+            store.record("action_failed", caller="+17075557777")
             return build_dashboard_state(
                 store=store,
                 door_name="Gate",
-                gate=GateStatus(state="held_open", mode="custom", until=time.time() + 900),
+                gate=GateStatus(state="secured", position="closed", relay="locked"),
                 caller_names={"+17075551111": "Oren"},
                 recent_limit=50,
+                now=NOW,
             )
 
-    def test_json_payload_shape(self):
+    def test_json_payload_is_versioned_and_semantic(self):
         payload = json.loads(render_dashboard_json(self._state()))
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["server_time"], NOW)
         self.assertEqual(payload["door"], "Gate")
-        self.assertEqual(payload["gate"]["state"], "held_open")
-        self.assertEqual(payload["gate"]["label"], "Held open")
-        self.assertGreater(payload["gate"]["remaining"], 0)
+        self.assertEqual(payload["gate"]["position"], "closed")
+        self.assertEqual(payload["gate"]["relay"], "locked")
+        self.assertIsNone(payload["gate"]["active_hold"])
+        self.assertGreater(payload["revision"], 0)
         self.assertEqual(len(payload["chart"]["buckets"]), 24)
-        self.assertEqual({s["key"] for s in payload["stats"]} & {"opens_today"}, {"opens_today"})
 
         events = {item["event"]: item for item in payload["events"]}
         self.assertEqual(events["unlock_success"]["name"], "Oren")
-        self.assertEqual(events["unlock_success"]["group"], "opens")
-        self.assertEqual(events["caller_blocked"]["group"], "denied")
-        self.assertEqual(events["caller_blocked"]["tone"], "serious")
+        self.assertEqual(events["unlock_success"]["id"], "call:CA1")
+        self.assertTrue(events["caller_blocked"]["id"].startswith("event:"))
+        self.assertNotIn("tone", events["caller_blocked"])
+        stats = {item["key"]: item["value"] for item in payload["stats"]}
+        self.assertEqual(stats["denied_week"], 2)
+        self.assertEqual(stats["errors_week"], 1)
 
-    def test_html_embeds_assets_and_bootstrap(self):
-        rendered = render_dashboard_html(self._state()).decode("utf-8")
-        self.assertIn("<title>Gate — Gate Control</title>", rendered)
-        self.assertIn('id="bootstrap"', rendered)
-        self.assertIn("--ring-progress", rendered)  # css inlined
-        self.assertIn("/dashboard/api/state", rendered)  # js inlined
-        self.assertNotIn("</script>{", rendered)
+    def test_compiled_index_and_hashed_assets_are_present(self):
+        self.assertEqual(missing_dashboard_assets(), [])
+        index = load_dashboard_asset("/dashboard")
+        self.assertIsNotNone(index)
+        self.assertEqual(index.cache_control, "no-store")
+        self.assertIn("text/html", index.content_type)
+        self.assertIn(b"/dashboard/assets/", index.body)
 
-    def test_bootstrap_json_is_parseable(self):
-        rendered = render_dashboard_html(self._state()).decode("utf-8")
-        start = rendered.index('id="bootstrap">') + len('id="bootstrap">')
-        end = rendered.index("</script>", start)
-        payload = json.loads(rendered[start:end].replace("<\\/", "</"))
-        self.assertEqual(payload["door"], "Gate")
+    def test_asset_loader_blocks_api_and_traversal(self):
+        self.assertIsNone(load_dashboard_asset("/dashboard/api/state"))
+        self.assertIsNone(load_dashboard_asset("/dashboard/../pyproject.toml"))
 
 
 if __name__ == "__main__":

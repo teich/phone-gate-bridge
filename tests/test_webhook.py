@@ -1,10 +1,18 @@
+import http.client
+import json
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import urlencode
 
-from gate_bridge.activity import ActivityEvent, ActivityStore
+from gate_bridge.activity import ActivityStore
+from gate_bridge.dashboard import GateStatus
 from gate_bridge.webhook import (
     AllowedCaller,
+    TwilioWebhookHandler,
+    WebhookConfig,
     build_twilio_signature,
     find_allowed_caller,
     is_ip_allowed,
@@ -12,6 +20,7 @@ from gate_bridge.webhook import (
     load_allowed_callers,
     normalize_phone,
     parse_cidr_list,
+    resolve_dashboard_db_path,
     twiml_gather,
     twiml_say,
 )
@@ -46,6 +55,7 @@ class WebhookHelpersTests(unittest.TestCase):
                         'name = "Oren"',
                         'notes = "Owner"',
                         "enabled = true",
+                        'actions = ["open", "hold_open"]',
                         "",
                         "[[callers]]",
                         'number = "+17075552222"',
@@ -60,7 +70,9 @@ class WebhookHelpersTests(unittest.TestCase):
             self.assertEqual(len(callers), 2)
             self.assertEqual(callers[0].name, "Oren")
             self.assertTrue(callers[0].enabled)
+            self.assertEqual(callers[0].actions, ("open", "hold_open"))
             self.assertFalse(callers[1].enabled)
+            self.assertEqual(callers[1].actions, ("open",))
 
     def test_twiml_output(self):
         output = twiml_say("The gate is now open.").decode("utf-8")
@@ -120,6 +132,24 @@ class WebhookHelpersTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_cidr_list("192.168.0.0/16,not-a-cidr")
 
+    def test_database_default_preserves_an_existing_legacy_store(self):
+        with TemporaryDirectory() as tmp:
+            legacy = Path(tmp) / "var" / "activity.sqlite3"
+            legacy.parent.mkdir()
+            legacy.touch()
+
+            self.assertEqual(
+                resolve_dashboard_db_path(None, legacy_path=str(legacy)),
+                str(legacy),
+            )
+            self.assertEqual(
+                resolve_dashboard_db_path(
+                    "/var/lib/phone-gate-bridge/custom.sqlite3",
+                    legacy_path=str(legacy),
+                ),
+                "/var/lib/phone-gate-bridge/custom.sqlite3",
+            )
+
     def test_activity_store_persists_records(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "activity.sqlite3"
@@ -135,6 +165,154 @@ class WebhookHelpersTests(unittest.TestCase):
             self.assertEqual(counts.get("unlock_success"), 1)
             self.assertEqual(len(recent), 1)
             self.assertEqual(recent[0].call_sid, "CA555")
+
+
+class FakeAccessClient:
+    unlock_calls = 0
+
+    def __init__(self, **_kwargs):
+        pass
+
+    def find_door_id(self, _door_name):
+        return "door-1"
+
+    def unlock_door(self, **_kwargs):
+        type(self).unlock_calls += 1
+        return {"code": "SUCCESS"}
+
+
+class FakeGateProbe:
+    def current(self, **_kwargs):
+        return GateStatus(state="secured", position="closed", relay="locked")
+
+
+class HandlerIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        root = Path(self.temp.name)
+        callers_path = root / "allowed-callers.toml"
+        callers_path.write_text(
+            "\n".join(
+                [
+                    "[[callers]]",
+                    'number = "+17075551111"',
+                    'name = "Oren"',
+                    'actions = ["open"]',
+                    "enabled = true",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        self.store = ActivityStore(str(root / "activity.sqlite3"))
+        self.config = WebhookConfig(
+            host="192.168.2.1",
+            token="token",
+            allowed_callers_file=str(callers_path),
+            twilio_auth_token="twilio-secret",
+            public_base_url="https://gate.example.test",
+            dashboard_db_path=str(root / "activity.sqlite3"),
+            max_webhook_body_bytes=128,
+        )
+        handler = type(
+            "TestTwilioWebhookHandler",
+            (TwilioWebhookHandler,),
+            {
+                "config": self.config,
+                "activity": self.store,
+                "dashboard_networks": parse_cidr_list("127.0.0.1/32"),
+                "gate_probe": FakeGateProbe(),
+                "access_client_class": FakeAccessClient,
+            },
+        )
+        FakeAccessClient.unlock_calls = 0
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temp.cleanup()
+
+    def request(self, method, path, *, body=b"", headers=None):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.server.server_address[1],
+            timeout=2,
+        )
+        connection.request(method, path, body=body, headers=headers or {})
+        response = connection.getresponse()
+        payload = response.read()
+        result = response.status, dict(response.getheaders()), payload
+        connection.close()
+        return result
+
+    def signed_post(self, path, values):
+        form = {key: [value] for key, value in values.items()}
+        signature = build_twilio_signature(
+            url=f"{self.config.public_base_url}{path}",
+            form=form,
+            auth_token=self.config.twilio_auth_token,
+        )
+        body = urlencode(values).encode("utf-8")
+        return self.request(
+            "POST",
+            path,
+            body=body,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-Twilio-Signature": signature,
+            },
+        )
+
+    def test_dashboard_page_state_and_security_headers(self):
+        page_status, page_headers, page = self.request("GET", "/dashboard")
+        state_status, state_headers, raw_state = self.request(
+            "GET",
+            "/dashboard/api/state",
+        )
+
+        self.assertEqual(page_status, 200)
+        self.assertIn(b"/dashboard/assets/", page)
+        self.assertEqual(page_headers["Cache-Control"], "no-store")
+        self.assertIn("frame-ancestors 'none'", page_headers["Content-Security-Policy"])
+        self.assertEqual(state_status, 200)
+        self.assertEqual(state_headers["Cache-Control"], "no-store")
+        self.assertEqual(json.loads(raw_state)["schema_version"], 1)
+
+        counts, _ = self.store.snapshot(20)
+        self.assertEqual(counts["dashboard_view"], 1)
+
+    def test_duplicate_confirm_actuates_gate_once(self):
+        values = {
+            "From": "+17075551111",
+            "CallSid": "CA-duplicate",
+            "Digits": "1",
+        }
+        first_status, _, first = self.signed_post("/twilio/voice/confirm", values)
+        second_status, _, second = self.signed_post("/twilio/voice/confirm", values)
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertIn(b"The gate is now open", first)
+        self.assertIn(b"The gate is now open", second)
+        self.assertEqual(FakeAccessClient.unlock_calls, 1)
+        counts, _ = self.store.snapshot(50)
+        self.assertEqual(counts["unlock_success"], 1)
+
+    def test_oversized_body_is_rejected_before_reading_or_signature_work(self):
+        status, _, body = self.request(
+            "POST",
+            "/twilio/voice",
+            body=b"x",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": "129",
+            },
+        )
+        self.assertEqual(status, 413)
+        self.assertEqual(body, b"request too large")
 
 
 if __name__ == "__main__":

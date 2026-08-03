@@ -137,7 +137,16 @@ class AccessClient:
                 raw = resp.read().decode("utf-8").strip()
                 if not raw:
                     return {}
-                return json.loads(raw)
+                decoded = json.loads(raw)
+                if not isinstance(decoded, dict):
+                    raise AccessApiError("Access API returned a non-object JSON response")
+                code = decoded.get("code")
+                if code is not None and str(code).upper() not in {"SUCCESS", "OK"}:
+                    detail = decoded.get("message") or decoded.get("msg") or decoded.get("data")
+                    raise AccessApiError(
+                        f"Access API reported {code}: {detail or 'request failed'}"
+                    )
+                return decoded
         except error.HTTPError as exc:
             body_text = ""
             if exc.fp is not None:

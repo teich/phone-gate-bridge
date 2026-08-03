@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - name: Check and build frontend
+        run: |
+          npm --prefix frontend run check
+          npm --prefix frontend run build
+          git diff --exit-code -- src/gate_bridge/static/dashboard
+
+      - name: Run backend tests
+        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Build and inspect wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel
+          python - <<'PY'
+          import glob
+          import re
+          import zipfile
+
+          wheel = glob.glob("dist/*.whl")[0]
+          with zipfile.ZipFile(wheel) as archive:
+              files = archive.namelist()
+              index_name = next(
+                  name for name in files if name.endswith("static/dashboard/index.html")
+              )
+              index = archive.read(index_name)
+          root = index_name.removesuffix("index.html")
+          expected = {index_name} | {
+              root + path.decode().removeprefix("/dashboard/")
+              for path in re.findall(rb'(?:src|href)="(/dashboard/[^"?#]+)"', index)
+          }
+          packaged = {
+              name for name in files if name.startswith(root) and not name.endswith("/")
+          }
+          assert packaged == expected, (packaged, expected)
+          PY

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phone-gate-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "UniFi Access gate unlock bridge"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,4 +23,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-gate_bridge = ["static/*.css", "static/*.js"]
+gate_bridge = [
+  "static/dashboard/index.html",
+  "static/dashboard/assets/*",
+]

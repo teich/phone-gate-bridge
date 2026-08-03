@@ -6,7 +6,6 @@
   button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
   ol, ul { list-style: none; padding: 0; }
   svg { fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
-  .sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
   .visually-hidden {
     position: absolute; width: 1px; height: 1px; overflow: hidden;
     clip-path: inset(50%); white-space: nowrap;
@@ -14,37 +13,35 @@
 }
 
 @layer tokens {
-  @property --ring-progress { syntax: "<number>"; inherits: true; initial-value: 1; }
   @property --bar-scale { syntax: "<number>"; inherits: false; initial-value: 0; }
 
   :root {
     color-scheme: dark;
 
-    --bg:        light-dark(oklch(0.975 0.006 250), oklch(0.155 0.014 258));
-    --bg-deep:   light-dark(oklch(0.945 0.008 250), oklch(0.125 0.014 258));
-    --surface:   light-dark(oklch(1 0 0 / 0.78),    oklch(0.215 0.016 258 / 0.72));
-    --surface-panel: light-dark(oklch(0.995 0.003 250), oklch(0.196 0.015 258));
-    --surface-2: light-dark(oklch(0.965 0.006 250), oklch(0.255 0.017 258));
-    --hairline:  light-dark(oklch(0.86 0.008 250),  oklch(0.34 0.018 258));
+    --bg: oklch(0.155 0.014 258);
+    --bg-deep: oklch(0.125 0.014 258);
+    --surface: oklch(0.215 0.016 258 / 0.72);
+    --surface-panel: oklch(0.196 0.015 258);
+    --surface-2: oklch(0.255 0.017 258);
+    --hairline: oklch(0.34 0.018 258);
     --hairline-soft: color-mix(in oklab, var(--hairline) 55%, transparent);
 
-    --ink:    light-dark(oklch(0.22 0.015 258), oklch(0.975 0.004 250));
-    --ink-2:  light-dark(oklch(0.44 0.014 258), oklch(0.755 0.012 250));
-    --ink-3:  light-dark(oklch(0.58 0.012 258), oklch(0.605 0.013 250));
+    --ink: oklch(0.975 0.004 250);
+    --ink-2: oklch(0.755 0.012 250);
+    --ink-3: oklch(0.605 0.013 250);
 
     /* Status palette — reserved, never used as a series colour. */
     --good: #0ca30c;
     --warning: #fab219;
     --serious: #ec835a;
     --critical: #d03b3b;
-    --series-1: light-dark(#2a78d6, #3987e5);
+    --series-1: #3987e5;
 
     --accent: var(--series-1);
-    --shadow: light-dark(0 1px 2px oklch(0.5 0.02 258 / 0.08), 0 1px 2px oklch(0 0 0 / 0.4));
-    --shadow-lg: light-dark(
-      0 24px 48px -24px oklch(0.45 0.03 258 / 0.28),
-      0 32px 64px -32px oklch(0 0 0 / 0.85)
-    );
+    --shadow: 0 1px 2px oklch(0 0 0 / 0.4);
+    --shadow-lg: 0 32px 64px -32px oklch(0 0 0 / 0.85);
+    --glow-opacity: 0.7;
+    --grain-opacity: 0.13;
 
     --radius: 18px;
     --radius-sm: 11px;
@@ -53,7 +50,23 @@
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", monospace;
   }
 
-  :root[data-theme="light"] { color-scheme: light; }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: oklch(0.975 0.006 250);
+    --bg-deep: oklch(0.945 0.008 250);
+    --surface: oklch(1 0 0 / 0.78);
+    --surface-panel: oklch(0.995 0.003 250);
+    --surface-2: oklch(0.965 0.006 250);
+    --hairline: oklch(0.86 0.008 250);
+    --ink: oklch(0.22 0.015 258);
+    --ink-2: oklch(0.44 0.014 258);
+    --ink-3: oklch(0.58 0.012 258);
+    --series-1: #2a78d6;
+    --shadow: 0 1px 2px oklch(0.5 0.02 258 / 0.08);
+    --shadow-lg: 0 24px 48px -24px oklch(0.45 0.03 258 / 0.28);
+    --glow-opacity: 0.55;
+    --grain-opacity: 0.1;
+  }
   :root[data-theme="dark"]  { color-scheme: dark; }
 
   /* The accent tracks gate state; everything tinted reads from it. */
@@ -72,17 +85,32 @@
 }
 
 @layer base {
-  html { -webkit-text-size-adjust: 100%; }
+  html {
+    min-height: 100%;
+    -webkit-text-size-adjust: 100%;
+  }
 
   body {
-    min-height: 100dvh;
+    min-height: 100%;
     font-family: var(--font);
     background: var(--bg-deep);
     color: var(--ink);
     line-height: 1.5;
     font-synthesis-weight: none;
     -webkit-font-smoothing: antialiased;
-    padding: clamp(0.75rem, 2vw, 1.5rem);
+  }
+
+  #root { min-height: 100%; }
+
+  .app-shell {
+    min-height: 100vh;
+    min-height: 100dvh;
+    --page-pad: clamp(0.75rem, 2vw, 1.5rem);
+    padding:
+      calc(var(--page-pad) + env(safe-area-inset-top))
+      calc(var(--page-pad) + env(safe-area-inset-right))
+      calc(var(--page-pad) + env(safe-area-inset-bottom))
+      calc(var(--page-pad) + env(safe-area-inset-left));
     display: flex;
     flex-direction: column;
     gap: clamp(0.9rem, 2vw, 1.4rem);
@@ -108,7 +136,7 @@
         color-mix(in oklab, var(--series-1) 26%, transparent) 0%,
         color-mix(in oklab, var(--series-1) 10%, transparent) 45%,
         transparent 74%);
-    opacity: light-dark(0.55, 0.7);
+    opacity: var(--glow-opacity);
     transition: background 900ms ease, opacity 900ms ease;
     animation: drift 30s ease-in-out infinite alternate;
   }
@@ -119,7 +147,7 @@
     inset: 0;
     z-index: -1;
     pointer-events: none;
-    opacity: light-dark(0.1, 0.13);
+    opacity: var(--grain-opacity);
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.32'/%3E%3C/svg%3E");
   }
 
@@ -217,10 +245,6 @@
     svg { inline-size: 16px; block-size: 16px; }
     &:hover { color: var(--ink); border-color: var(--hairline); transform: translateY(-1px); }
   }
-  /* Each icon shows the theme you would switch *to*. */
-  :root[data-theme="light"] .only-dark,
-  :root:not([data-theme="light"]) .only-light { display: none; }
-
   .foot {
     width: min(1180px, 100%);
     margin-inline: auto;
@@ -232,7 +256,6 @@
 
 @layer hero {
   .hero {
-    view-transition-name: hero;
     position: relative;
     display: flex;
     flex-wrap: wrap;
@@ -306,7 +329,6 @@
   .hero-dial {
     display: grid; justify-items: center; gap: 0.6rem;
     transition: opacity 400ms ease, scale 400ms ease;
-    &[data-visible="false"] { display: none; }
   }
 
   .ring {
@@ -316,16 +338,22 @@
     display: grid; place-items: center;
   }
 
-  /* The arc lives on a pseudo-element so the mask does not eat the label. */
-  .ring::before {
-    content: "";
-    position: absolute; inset: 0;
-    border-radius: 50%;
-    background: conic-gradient(from -90deg,
-      var(--accent) calc(var(--ring-progress) * 360deg),
-      color-mix(in oklab, var(--hairline) 70%, transparent) 0);
-    mask: radial-gradient(closest-side, transparent 0 77%, #000 78%);
-    filter: drop-shadow(0 0 16px color-mix(in oklab, var(--accent) 40%, transparent));
+  .ring-svg {
+    position: absolute;
+    inset: 0;
+    inline-size: 100%;
+    block-size: 100%;
+    overflow: visible;
+    transform: rotate(-90deg);
+    stroke-width: 7;
+  }
+  .ring-track {
+    stroke: color-mix(in oklab, var(--hairline) 70%, transparent);
+  }
+  .ring-progress {
+    stroke: var(--accent);
+    filter: drop-shadow(0 0 7px color-mix(in oklab, var(--accent) 45%, transparent));
+    transition: stroke-dashoffset 250ms linear, stroke 700ms ease;
   }
 
   .ring-inner { position: relative; display: grid; place-items: center; gap: 0.1rem; }
@@ -412,6 +440,34 @@
   }
 
   .empty { padding: 2rem 0 1rem; text-align: center; color: var(--ink-3); font-size: 0.85rem; }
+
+  .loading-panel {
+    min-block-size: 16rem;
+    display: grid;
+    place-content: center;
+    justify-items: center;
+    gap: 0.75rem;
+    text-align: center;
+
+    h1 { font-size: 1.2rem; }
+    p { max-inline-size: 46ch; color: var(--ink-2); }
+  }
+  .loading-dot {
+    inline-size: 10px;
+    block-size: 10px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 0 color-mix(in oklab, var(--accent) 50%, transparent);
+    animation: pulse 1.4s ease-out infinite;
+  }
+  .retry-button {
+    padding: 0.45rem 0.85rem;
+    border-radius: 9px;
+    color: var(--bg-deep);
+    background: var(--ink);
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
 }
 
 @layer chart {
@@ -442,6 +498,7 @@
     background: var(--series-1);
     transform-origin: bottom;
     transition: filter 140ms ease;
+    padding: 0;
 
     &[data-zero="true"] { background: var(--hairline); opacity: 0.55; }
     &:hover, &:focus-visible { filter: brightness(1.18) saturate(1.1); }
@@ -556,31 +613,11 @@
 }
 
 @layer motion {
-  /* Rows fade in as they scroll into the panel — pure CSS, no observer. */
-  @supports (animation-timeline: view()) {
-    @media (prefers-reduced-motion: no-preference) {
-      .row {
-        animation: rise linear both;
-        animation-timeline: view();
-        animation-range: entry 0% entry 26%;
-      }
-    }
-  }
-  @keyframes rise {
-    from { opacity: 0; transform: translateY(6px); }
-    to   { opacity: 1; transform: none; }
-  }
-
   @media (prefers-reduced-motion: no-preference) {
     .stat, .hero {
       @starting-style { opacity: 0; transform: translateY(8px); }
     }
     .stat, .hero { transition-property: opacity, transform, border-color, background; }
-  }
-
-  ::view-transition-old(hero), ::view-transition-new(hero) {
-    animation-duration: 380ms;
-    animation-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
   @media (prefers-reduced-motion: reduce) {
