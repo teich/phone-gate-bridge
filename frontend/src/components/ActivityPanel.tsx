@@ -3,23 +3,24 @@ import { useState } from "react";
 import type { DashboardEvent } from "../api/types";
 import { prettyNumber, relativeTime, timestampFormatter } from "../format";
 import { useNow } from "../hooks/useNow";
-import { presentEvent, type EventGroup } from "../presentation";
+import { presentEvent } from "../presentation";
 import { Icon } from "./Icon";
 
-type Filter = "all" | "opens" | "denied" | "errors";
+type Filter = "activity" | "opens" | "denied" | "errors" | "dashboard";
 
 const filters: Array<{ key: Filter; label: string }> = [
-  { key: "all", label: "All" },
+  { key: "activity", label: "Activity" },
   { key: "opens", label: "Opens" },
   { key: "denied", label: "Denied" },
   { key: "errors", label: "Errors" },
+  { key: "dashboard", label: "Dashboard" },
 ];
 
 export function ActivityPanel({ events }: { events: DashboardEvent[] }) {
-  const [filter, setFilter] = useState<Filter>("all");
+  const [filter, setFilter] = useState<Filter>("activity");
   const now = useNow(15_000);
 
-  const shown = events.filter((event) => isVisible(presentEvent(event.event).group, filter));
+  const shown = events.filter((event) => isVisible(event, filter));
 
   return (
     <section className="panel" aria-labelledby="feed-title">
@@ -47,7 +48,7 @@ export function ActivityPanel({ events }: { events: DashboardEvent[] }) {
         {events.map((event) => (
           <ActivityRow
             event={event}
-            hidden={!isVisible(presentEvent(event.event).group, filter)}
+            hidden={!isVisible(event, filter)}
             key={event.id}
             now={now}
           />
@@ -105,8 +106,10 @@ function ActivityRow({
   );
 }
 
-function isVisible(group: EventGroup, filter: Filter): boolean {
-  return filter === "all" || group === filter;
+function isVisible(event: DashboardEvent, filter: Filter): boolean {
+  if (filter === "activity") return event.event !== "dashboard_view";
+  if (filter === "dashboard") return event.event === "dashboard_view";
+  return presentEvent(event.event).group === filter;
 }
 
 function formatDetail(event: DashboardEvent): string {
