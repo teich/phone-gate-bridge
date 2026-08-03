@@ -2,11 +2,9 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from gate_bridge.activity import ActivityEvent, ActivityStore
 from gate_bridge.webhook import (
-    ActivityEvent,
-    ActivityStore,
     AllowedCaller,
-    build_dashboard_html,
     build_twilio_signature,
     find_allowed_caller,
     is_ip_allowed,
@@ -121,29 +119,6 @@ class WebhookHelpersTests(unittest.TestCase):
     def test_parse_cidr_list_rejects_invalid(self):
         with self.assertRaises(ValueError):
             parse_cidr_list("192.168.0.0/16,not-a-cidr")
-
-    def test_dashboard_html_contains_metrics(self):
-        rendered = build_dashboard_html(
-            counts={
-                "unlock_success": 3,
-                "caller_blocked": 1,
-                "signature_invalid": 2,
-                "unlock_failed": 1,
-            },
-            recent=[
-                ActivityEvent(
-                    ts=1700000000.0,
-                    event="unlock_success",
-                    detail="Gate",
-                    caller="+17075551111",
-                    call_sid="CA123",
-                )
-            ],
-            door_name="Gate",
-        ).decode("utf-8")
-        self.assertIn("Phone Gate Activity - Gate", rendered)
-        self.assertIn("Unlock Success", rendered)
-        self.assertIn("+17075551111", rendered)
 
     def test_activity_store_persists_records(self):
         with TemporaryDirectory() as tmp:

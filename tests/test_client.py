@@ -41,6 +41,32 @@ class AccessClientTests(unittest.TestCase):
             door_id = client.find_door_id("gate")
             self.assertEqual(door_id, "2")
 
+    def test_find_door_returns_live_status_fields(self):
+        client = AccessClient(host="192.168.1.1", token="token-abc")
+
+        with patch("gate_bridge.client.request.urlopen") as mocked:
+            mocked.return_value = FakeResponse(
+                json.dumps(
+                    {
+                        "code": "SUCCESS",
+                        "data": [
+                            {
+                                "id": "2",
+                                "name": "Gate",
+                                "full_name": "Site - Gate",
+                                "door_position_status": "close",
+                                "door_lock_relay_status": "lock",
+                            },
+                        ],
+                    }
+                )
+            )
+
+            door = client.find_door("gate")
+            self.assertEqual(door["id"], "2")
+            self.assertEqual(door["door_position_status"], "close")
+            self.assertEqual(door["door_lock_relay_status"], "lock")
+
     def test_find_door_id_ambiguous(self):
         client = AccessClient(host="192.168.1.1", token="token-abc")
 

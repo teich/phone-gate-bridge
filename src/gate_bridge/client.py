@@ -32,7 +32,13 @@ class AccessClient:
         )
         return self._send(req)
 
-    def find_door_id(self, door_name: str = "Gate") -> str:
+    def find_door(self, door_name: str = "Gate") -> dict[str, Any]:
+        """Return the full door record whose name matches `door_name`.
+
+        The doors listing carries live state (`door_position_status`,
+        `door_lock_relay_status`) alongside the id, so a caller that wants
+        status gets it from this one request rather than a second lookup.
+        """
         if not door_name:
             raise ValueError("door_name is required")
 
@@ -69,9 +75,15 @@ class AccessClient:
                 f"Door name '{door_name}' is ambiguous. Matches: {names}"
             )
 
-        door_id = matches[0].get("id")
+        door = matches[0]
+        door_id = door.get("id")
         if not isinstance(door_id, str) or not door_id.strip():
             raise AccessApiError("Matched door is missing a valid id")
+        return door
+
+    def find_door_id(self, door_name: str = "Gate") -> str:
+        door_id = self.find_door(door_name)["id"]
+        assert isinstance(door_id, str)
         return door_id
 
     def unlock_door(
@@ -111,11 +123,6 @@ class AccessClient:
                 "Content-Type": "application/json",
             },
         )
-
-        context = ssl.create_default_context()
-        if not self.verify_tls:
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
 
         return self._send(req)
 

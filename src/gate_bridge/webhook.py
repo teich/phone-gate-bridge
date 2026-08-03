@@ -5,17 +5,23 @@ import ipaddress
 import hashlib
 import hmac
 import os
-import sqlite3
 import threading
 import time
 import xml.sax.saxutils as saxutils
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Union
 from urllib.parse import parse_qs, urlparse
 
+from gate_bridge.activity import ActivityStore
 from gate_bridge.client import AccessApiError, AccessClient
+from gate_bridge.dashboard import (
+    GateStatus,
+    build_dashboard_state,
+    build_gate_status,
+    render_dashboard_html,
+    render_dashboard_json,
+)
 
 try:
     import tomllib  # type: ignore[attr-defined]
@@ -58,91 +64,6 @@ class AllowedCaller:
     name: str = ""
     enabled: bool = True
     notes: str = ""
-
-
-@dataclass(frozen=True)
-class ActivityEvent:
-    ts: float
-    event: str
-    detail: str
-    caller: str
-    call_sid: str
-
-
-class ActivityStore:
-    def __init__(self, db_path: str) -> None:
-        self._db_path = Path(db_path)
-        self._lock = threading.Lock()
-        parent = self._db_path.parent
-        if str(parent) and str(parent) != ".":
-            parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self._db_path), timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _initialize(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts REAL NOT NULL,
-                    event TEXT NOT NULL,
-                    detail TEXT NOT NULL,
-                    caller TEXT NOT NULL,
-                    call_sid TEXT NOT NULL
-                )
-                """
-            )
-            conn.commit()
-
-    def record(
-        self,
-        event: str,
-        *,
-        detail: str = "",
-        caller: str = "",
-        call_sid: str = "",
-    ) -> None:
-        item = ActivityEvent(
-            ts=time.time(),
-            event=event,
-            detail=detail,
-            caller=caller,
-            call_sid=call_sid,
-        )
-        with self._lock:
-            with self._connect() as conn:
-                conn.execute(
-                    "INSERT INTO events (ts, event, detail, caller, call_sid) VALUES (?, ?, ?, ?, ?)",
-                    (item.ts, item.event, item.detail, item.caller, item.call_sid),
-                )
-                conn.commit()
-
-    def snapshot(self, recent_limit: int) -> tuple[dict[str, int], list[ActivityEvent]]:
-        with self._connect() as conn:
-            counts_rows = conn.execute(
-                "SELECT event, COUNT(*) AS count FROM events GROUP BY event"
-            ).fetchall()
-            recent_rows = conn.execute(
-                "SELECT ts, event, detail, caller, call_sid FROM events ORDER BY id DESC LIMIT ?",
-                (max(1, recent_limit),),
-            ).fetchall()
-        counts = {str(row["event"]): int(row["count"]) for row in counts_rows}
-        recent = [
-            ActivityEvent(
-                ts=float(row["ts"]),
-                event=str(row["event"]),
-                detail=str(row["detail"]),
-                caller=str(row["caller"]),
-                call_sid=str(row["call_sid"]),
-            )
-            for row in recent_rows
-        ]
-        return counts, recent
 
 
 def normalize_phone(value: str) -> str:
@@ -255,70 +176,6 @@ def is_ip_allowed(ip_text: str, networks: tuple[IpNetwork, ...]) -> bool:
     return False
 
 
-def build_dashboard_html(
-    *,
-    counts: dict[str, int],
-    recent: list[ActivityEvent],
-    door_name: str,
-) -> bytes:
-    total = sum(counts.values())
-    success = counts.get("unlock_success", 0)
-    blocked = counts.get("caller_blocked", 0)
-    signature_failures = counts.get("signature_invalid", 0)
-    unlock_errors = counts.get("unlock_failed", 0)
-    rows = [
-        ("Total Events", str(total)),
-        ("Unlock Success", str(success)),
-        ("Unlock Failures", str(unlock_errors)),
-        ("Blocked Callers", str(blocked)),
-        ("Signature Failures", str(signature_failures)),
-    ]
-    metrics_html = "".join(
-        f"<tr><th>{saxutils.escape(label)}</th><td>{saxutils.escape(value)}</td></tr>"
-        for label, value in rows
-    )
-    recent_html = "".join(
-        (
-            "<tr>"
-            f"<td>{saxutils.escape(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(item.ts)))}</td>"
-            f"<td>{saxutils.escape(item.event)}</td>"
-            f"<td>{saxutils.escape(item.caller)}</td>"
-            f"<td>{saxutils.escape(item.call_sid)}</td>"
-            f"<td>{saxutils.escape(item.detail)}</td>"
-            "</tr>"
-        )
-        for item in recent
-    )
-    if not recent_html:
-        recent_html = "<tr><td colspan=\"5\">No activity yet.</td></tr>"
-    title = saxutils.escape(f"Phone Gate Activity - {door_name}")
-    html = (
-        "<!doctype html>"
-        "<html><head>"
-        f"<title>{title}</title>"
-        "<meta charset=\"utf-8\">"
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-        "<style>"
-        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:20px;color:#1f2937;}"
-        "h1{margin:0 0 12px 0;font-size:1.4rem;}"
-        "table{border-collapse:collapse;width:100%;margin:12px 0;}"
-        "th,td{border:1px solid #d1d5db;padding:8px;text-align:left;vertical-align:top;}"
-        "th{background:#f3f4f6;}"
-        ".muted{color:#6b7280;font-size:0.9rem;}"
-        "</style>"
-        "</head><body>"
-        f"<h1>{title}</h1>"
-        "<p class=\"muted\">Dashboard is only available from configured local networks.</p>"
-        "<h2>Summary</h2>"
-        f"<table>{metrics_html}</table>"
-        "<h2>Recent Events</h2>"
-        "<table><tr><th>Time</th><th>Event</th><th>Caller</th><th>Call SID</th><th>Detail</th></tr>"
-        f"{recent_html}</table>"
-        "</body></html>"
-    )
-    return html.encode("utf-8")
-
-
 def twiml_say(message: str, voice: str = "Polly.Joanna-Neural") -> bytes:
     safe = saxutils.escape(message)
     safe_voice = saxutils.escape(voice)
@@ -425,10 +282,73 @@ def load_config_from_env() -> WebhookConfig:
     )
 
 
+class GateStatusProbe:
+    """Reads the door's live status, with caching so polling stays cheap.
+
+    The dashboard polls every few seconds; the controller should not see that
+    rate. Successful reads are cached briefly and failures are cached for
+    longer so a controller that is down is not hammered.
+    """
+
+    def __init__(
+        self,
+        config: WebhookConfig,
+        *,
+        ttl: float = 2.5,
+        error_ttl: float = 20.0,
+    ) -> None:
+        self._config = config
+        self._ttl = ttl
+        self._error_ttl = error_ttl
+        self._lock = threading.Lock()
+        self._door: dict | None = None
+        self._error = ""
+        self._checked_at = 0.0
+
+    def _client(self) -> AccessClient:
+        return AccessClient(
+            host=self._config.host,
+            token=self._config.token,
+            port=self._config.access_port,
+            timeout=self._config.timeout,
+            verify_tls=self._config.verify_tls,
+        )
+
+    def _read_door(self) -> tuple[dict | None, str]:
+        try:
+            # The doors listing carries live status, so one request covers both
+            # finding the gate and reading its state.
+            return self._client().find_door(self._config.door_name), ""
+        except (AccessApiError, ValueError) as exc:
+            return None, str(exc)
+
+    def current(
+        self,
+        *,
+        last_unlock: ActivityEvent | None,
+        last_hold: ActivityEvent | None = None,
+    ) -> GateStatus:
+        with self._lock:
+            now = time.time()
+            ttl = self._error_ttl if self._door is None and self._error else self._ttl
+            if now - self._checked_at > ttl:
+                self._door, self._error = self._read_door()
+                self._checked_at = now
+            door, error = self._door, self._error
+
+        return build_gate_status(
+            door=door,
+            door_error=error,
+            last_unlock=last_unlock,
+            hold_started_at=last_hold.ts if last_hold is not None else None,
+        )
+
+
 class TwilioWebhookHandler(BaseHTTPRequestHandler):
     config: WebhookConfig
     activity: ActivityStore
     dashboard_networks: tuple[IpNetwork, ...]
+    gate_probe: GateStatusProbe
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -565,23 +485,48 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"ok")
             return
-        if path == "/dashboard":
+        if path in {"/dashboard", "/dashboard/api/state"}:
             remote_ip = self.client_address[0] if self.client_address else ""
             if not is_ip_allowed(remote_ip, self.dashboard_networks):
                 self.activity.record("dashboard_denied", detail=remote_ip)
                 self._send_plain(403, b"forbidden")
                 return
-            counts, recent = self.activity.snapshot(self.config.dashboard_recent_events_limit)
-            body = build_dashboard_html(
-                counts=counts,
-                recent=recent,
-                door_name=self.config.door_name,
-            )
-            self.activity.record("dashboard_view", detail=remote_ip)
-            self._send_html(200, body)
+
+            if path == "/dashboard":
+                # Only page loads are audited. The state endpoint is polled
+                # every few seconds and would bury the log.
+                self.activity.record("dashboard_view", detail=remote_ip)
+
+            state = self._dashboard_state()
+            if path == "/dashboard":
+                self._send_html(200, render_dashboard_html(state))
+            else:
+                self._send_json(200, render_dashboard_json(state))
             return
         self.send_response(404)
         self.end_headers()
+
+    def _dashboard_state(self):
+        try:
+            caller_names = {
+                caller.number: caller.name
+                for caller in load_allowed_callers(self.config.allowed_callers_file)
+                if caller.name
+            }
+        except (OSError, ValueError):
+            caller_names = {}
+
+        gate = self.gate_probe.current(
+            last_unlock=self.activity.latest(("unlock_success",)),
+            last_hold=self.activity.latest(("hold_open",)),
+        )
+        return build_dashboard_state(
+            store=self.activity,
+            door_name=self.config.door_name,
+            gate=gate,
+            caller_names=caller_names,
+            recent_limit=self.config.dashboard_recent_events_limit,
+        )
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
@@ -604,6 +549,15 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -617,6 +571,7 @@ def run_server(config: WebhookConfig) -> None:
             "config": config,
             "activity": ActivityStore(config.dashboard_db_path),
             "dashboard_networks": dashboard_networks,
+            "gate_probe": GateStatusProbe(config),
         },
     )
     server = ThreadingHTTPServer((config.bind_host, config.bind_port), handler)

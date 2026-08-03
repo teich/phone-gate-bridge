@@ -56,11 +56,75 @@ Health check:
 curl -sS http://127.0.0.1:8080/healthz
 ```
 
-Dashboard (local networks only):
+## Admin dashboard
 
-```bash
-curl -sS http://127.0.0.1:8080/dashboard
+Open `http://<host>:8080/dashboard` from a machine on an allowed network
+(`DASHBOARD_ALLOWED_CIDRS`). It is **read-only** and is not exposed through the
+Cloudflare tunnel — the tunnel only routes `/twilio/*` and `/healthz`.
+
+It shows:
+
+- **Live gate status** — secured, opening, or held open, with a countdown ring
+  and the time the hold expires.
+- **Summary tiles** — opens today/this week, distinct callers, denied attempts,
+  failures.
+- **Gate opens** — hourly for the last 24 hours.
+- **Activity** — one row per phone call, filterable, with caller names resolved
+  from `ALLOWED_CALLERS_FILE`.
+
+Two routes back the page:
+
+| Route | Purpose |
+|---|---|
+| `GET /dashboard` | The page. CSS and JS are inlined, so there is one request. |
+| `GET /dashboard/api/state` | JSON state; the page polls it every 3s. |
+
+Both are behind the same CIDR check. Page loads are audited as `dashboard_view`;
+the polled state endpoint is not, so it does not flood the log.
+
+### Where gate status comes from
+
+Status comes from the doors listing (`GET /api/v1/developer/doors`, via
+`AccessClient.find_door`), cached for a couple of seconds so polling does not
+reach the controller at the same rate. That one request carries both the door id
+and its live state, so no second lookup is needed.
+
+Two fields drive the display:
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `door_position_status` | `open` / `close` | physical position sensor |
+| `door_lock_relay_status` | `unlock` / `lock` | strike relay |
+
+Position wins when it reports `open` — a gate that has swung is open whatever
+the relay has since done. A released relay behind a closed gate reads as
+**Opening**. Either field can be null on a door with no sensor or no hub; a door
+reporting neither reads as **Status unavailable** rather than claiming the gate
+is locked, as does an unreachable controller.
+
+A momentary unlock can finish between polls without ever showing on the door
+record, so a `unlock_success` in the last 12 seconds is also surfaced as
+**Opening** straight from the activity log.
+
+### Contract for caller-initiated hold-open
+
+When hold-open is added, record the activity event below and the dashboard picks
+it up with no further changes:
+
+```python
+activity.record("hold_open", detail=str(minutes), caller=from_number, call_sid=call_sid)
 ```
+
+`detail` must be the hold length in whole minutes. The lock rule supplies the
+expiry; this event supplies the *original* duration, which is what lets the
+countdown ring show elapsed-vs-total instead of guessing. Without it the ring
+still counts down, using the largest remaining time it has observed as the span.
+
+### Editing the look
+
+Styles and behaviour live in `src/gate_bridge/static/dashboard.css` and
+`dashboard.js`. They are read from disk once per process and cached, so restart
+the service after editing them.
 
 ## Environment file
 

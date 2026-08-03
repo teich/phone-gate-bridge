@@ -1,0 +1,594 @@
+@layer reset, tokens, base, layout, hero, panels, chart, feed, motion;
+
+@layer reset {
+  *, *::before, *::after { box-sizing: border-box; }
+  * { margin: 0; }
+  button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+  ol, ul { list-style: none; padding: 0; }
+  svg { fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  .sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip-path: inset(50%); white-space: nowrap;
+  }
+}
+
+@layer tokens {
+  @property --ring-progress { syntax: "<number>"; inherits: true; initial-value: 1; }
+  @property --bar-scale { syntax: "<number>"; inherits: false; initial-value: 0; }
+
+  :root {
+    color-scheme: dark;
+
+    --bg:        light-dark(oklch(0.975 0.006 250), oklch(0.155 0.014 258));
+    --bg-deep:   light-dark(oklch(0.945 0.008 250), oklch(0.125 0.014 258));
+    --surface:   light-dark(oklch(1 0 0 / 0.78),    oklch(0.215 0.016 258 / 0.72));
+    --surface-panel: light-dark(oklch(0.995 0.003 250), oklch(0.196 0.015 258));
+    --surface-2: light-dark(oklch(0.965 0.006 250), oklch(0.255 0.017 258));
+    --hairline:  light-dark(oklch(0.86 0.008 250),  oklch(0.34 0.018 258));
+    --hairline-soft: color-mix(in oklab, var(--hairline) 55%, transparent);
+
+    --ink:    light-dark(oklch(0.22 0.015 258), oklch(0.975 0.004 250));
+    --ink-2:  light-dark(oklch(0.44 0.014 258), oklch(0.755 0.012 250));
+    --ink-3:  light-dark(oklch(0.58 0.012 258), oklch(0.605 0.013 250));
+
+    /* Status palette — reserved, never used as a series colour. */
+    --good: #0ca30c;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #d03b3b;
+    --series-1: light-dark(#2a78d6, #3987e5);
+
+    --accent: var(--series-1);
+    --shadow: light-dark(0 1px 2px oklch(0.5 0.02 258 / 0.08), 0 1px 2px oklch(0 0 0 / 0.4));
+    --shadow-lg: light-dark(
+      0 24px 48px -24px oklch(0.45 0.03 258 / 0.28),
+      0 32px 64px -32px oklch(0 0 0 / 0.85)
+    );
+
+    --radius: 18px;
+    --radius-sm: 11px;
+    --pad: clamp(1rem, 0.6rem + 1.6vw, 1.75rem);
+    --font: ui-sans-serif, -apple-system, "SF Pro Text", "Segoe UI", Inter, system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", monospace;
+  }
+
+  :root[data-theme="light"] { color-scheme: light; }
+  :root[data-theme="dark"]  { color-scheme: dark; }
+
+  /* The accent tracks gate state; everything tinted reads from it. */
+  :root[data-state="secured"]   { --accent: var(--good); }
+  :root[data-state="opening"]   { --accent: var(--series-1); }
+  :root[data-state="open"]      { --accent: var(--warning); }
+  :root[data-state="held_open"] { --accent: var(--warning); }
+  :root[data-state="unknown"]   { --accent: var(--ink-3); }
+
+  .tone-good     { --tone: var(--good); }
+  .tone-warning  { --tone: var(--warning); }
+  .tone-serious  { --tone: var(--serious); }
+  .tone-critical { --tone: var(--critical); }
+  .tone-neutral  { --tone: var(--series-1); }
+  .tone-muted    { --tone: var(--ink-3); }
+}
+
+@layer base {
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    min-height: 100dvh;
+    font-family: var(--font);
+    background: var(--bg-deep);
+    color: var(--ink);
+    line-height: 1.5;
+    font-synthesis-weight: none;
+    -webkit-font-smoothing: antialiased;
+    padding: clamp(0.75rem, 2vw, 1.5rem);
+    display: flex;
+    flex-direction: column;
+    gap: clamp(0.9rem, 2vw, 1.4rem);
+  }
+
+  /* Ambient field: a slow-drifting wash tinted by gate state, plus fine grain.
+     Radial gradients are already soft, so no blur filter is used — a
+     full-viewport filter layer forces an expensive repaint on every frame.
+     The drift animates `transform` only, which stays on the compositor. */
+  .glow {
+    position: fixed;
+    inset: -45vh -25vw auto;
+    height: 120vh;
+    z-index: -2;
+    pointer-events: none;
+    will-change: transform;
+    background:
+      radial-gradient(40% 34% at 30% 42%,
+        color-mix(in oklab, var(--accent) 38%, transparent) 0%,
+        color-mix(in oklab, var(--accent) 16%, transparent) 42%,
+        transparent 72%),
+      radial-gradient(34% 30% at 72% 26%,
+        color-mix(in oklab, var(--series-1) 26%, transparent) 0%,
+        color-mix(in oklab, var(--series-1) 10%, transparent) 45%,
+        transparent 74%);
+    opacity: light-dark(0.55, 0.7);
+    transition: background 900ms ease, opacity 900ms ease;
+    animation: drift 30s ease-in-out infinite alternate;
+  }
+
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    opacity: light-dark(0.1, 0.13);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.32'/%3E%3C/svg%3E");
+  }
+
+  @keyframes drift {
+    from { transform: translate3d(-3%, 0, 0) scale(1); }
+    to   { transform: translate3d(4%, 2%, 0) scale(1.08); }
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 6px;
+  }
+
+  h1, h2 { font-weight: 600; letter-spacing: -0.02em; text-wrap: balance; }
+  .num { font-variant-numeric: tabular-nums; }
+}
+
+@layer layout {
+  main {
+    width: min(1180px, 100%);
+    margin-inline: auto;
+    display: grid;
+    gap: clamp(0.9rem, 2vw, 1.4rem);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  main > section { grid-column: 1 / -1; }
+
+  @media (min-width: 62rem) {
+    .chart-panel { grid-column: 1 / -1; }
+  }
+
+  .topbar {
+    width: min(1180px, 100%);
+    margin-inline: auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding-inline: 0.25rem;
+  }
+
+  .brand { display: flex; align-items: center; gap: 0.7rem; }
+
+  .brand-mark {
+    inline-size: 30px; block-size: 30px;
+    border-radius: 9px;
+    background: linear-gradient(150deg, var(--accent), color-mix(in oklab, var(--accent) 35%, var(--bg-deep)));
+    box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 40%, transparent),
+                0 6px 18px -8px var(--accent);
+    transition: background 700ms ease, box-shadow 700ms ease;
+  }
+
+  .brand-text { display: grid; line-height: 1.25; }
+  .brand-text strong { font-size: 0.95rem; letter-spacing: -0.01em; }
+  .brand-text span { font-size: 0.75rem; color: var(--ink-3); }
+
+  .topbar-actions { display: flex; align-items: center; gap: 0.6rem; }
+
+  .live {
+    display: inline-flex; align-items: center; gap: 0.45rem;
+    padding: 0.3rem 0.7rem 0.3rem 0.55rem;
+    font-size: 0.75rem; font-weight: 500;
+    color: var(--ink-2);
+    border: 1px solid var(--hairline-soft);
+    border-radius: 999px;
+    background: var(--surface);
+    backdrop-filter: blur(12px);
+  }
+  .live-dot {
+    inline-size: 7px; block-size: 7px; border-radius: 50%;
+    background: var(--good);
+    box-shadow: 0 0 0 0 color-mix(in oklab, var(--good) 60%, transparent);
+    animation: pulse 2.4s ease-out infinite;
+  }
+  .live[data-status="retry"] { .live-dot { background: var(--warning); animation-duration: 1s; } }
+  .live[data-status="down"]  { .live-dot { background: var(--critical); animation: none; } }
+
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in oklab, currentColor 0%, transparent); }
+    35%  { box-shadow: 0 0 0 5px color-mix(in oklab, var(--good) 22%, transparent); }
+    100% { box-shadow: 0 0 0 8px transparent; }
+  }
+
+  .icon-button {
+    display: grid; place-items: center;
+    inline-size: 34px; block-size: 34px;
+    border-radius: 10px;
+    border: 1px solid var(--hairline-soft);
+    background: var(--surface);
+    backdrop-filter: blur(12px);
+    color: var(--ink-2);
+    transition: color 160ms, border-color 160ms, transform 160ms;
+
+    svg { inline-size: 16px; block-size: 16px; }
+    &:hover { color: var(--ink); border-color: var(--hairline); transform: translateY(-1px); }
+  }
+  /* Each icon shows the theme you would switch *to*. */
+  :root[data-theme="light"] .only-dark,
+  :root:not([data-theme="light"]) .only-light { display: none; }
+
+  .foot {
+    width: min(1180px, 100%);
+    margin-inline: auto;
+    display: flex; justify-content: space-between; gap: 1rem;
+    padding: 0.25rem;
+    font-size: 0.73rem; color: var(--ink-3);
+  }
+}
+
+@layer hero {
+  .hero {
+    view-transition-name: hero;
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: clamp(1rem, 3vw, 2.5rem);
+    padding: clamp(1.4rem, 1rem + 2vw, 2.4rem);
+    border-radius: calc(var(--radius) + 6px);
+    border: 1px solid var(--hairline-soft);
+    background:
+      linear-gradient(160deg,
+        color-mix(in oklab, var(--accent) 12%, transparent),
+        transparent 46%),
+      var(--surface);
+    backdrop-filter: blur(24px) saturate(1.3);
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+    transition: background 700ms ease, border-color 700ms ease;
+  }
+
+  /* A hairline of accent along the top edge — the state read at a glance. */
+  .hero::before {
+    content: "";
+    position: absolute; inset-inline: 0; inset-block-start: 0;
+    block-size: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent) 22%, var(--accent) 78%, transparent);
+    opacity: 0.85;
+  }
+
+  .hero-body { display: grid; gap: 0.4rem; min-inline-size: min(100%, 20rem); flex: 1 1 22rem; }
+
+  .hero-eyebrow {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    font-size: 0.76rem; font-weight: 550; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .state-dot {
+    inline-size: 8px; block-size: 8px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 12px var(--accent);
+    transition: background 500ms ease, box-shadow 500ms ease;
+  }
+  :root[data-state="held_open"] .state-dot,
+  :root[data-state="open"] .state-dot,
+  :root[data-state="opening"] .state-dot { animation: blink 1.6s ease-in-out infinite; }
+  @keyframes blink { 50% { opacity: 0.35; } }
+
+  .hero-state {
+    font-size: clamp(2.4rem, 1.4rem + 4.4vw, 4.2rem);
+    line-height: 1.02;
+    letter-spacing: -0.045em;
+    background: linear-gradient(170deg, var(--ink), color-mix(in oklab, var(--ink) 62%, var(--accent)));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .hero-note { color: var(--ink-2); font-size: 0.95rem; max-inline-size: 46ch; text-wrap: pretty; }
+
+  .hero-meta {
+    display: flex; flex-wrap: wrap; gap: 0.35rem 1.6rem;
+    margin-block-start: 0.85rem;
+    font-size: 0.8rem;
+
+    div { display: grid; gap: 0.1rem; }
+    dt { color: var(--ink-3); font-size: 0.7rem; letter-spacing: 0.05em; text-transform: uppercase; }
+    dd { color: var(--ink); font-variant-numeric: tabular-nums; }
+  }
+
+  .hero-dial {
+    display: grid; justify-items: center; gap: 0.6rem;
+    transition: opacity 400ms ease, scale 400ms ease;
+    &[data-visible="false"] { display: none; }
+  }
+
+  .ring {
+    --size: clamp(9rem, 7rem + 6vw, 12rem);
+    position: relative;
+    inline-size: var(--size); block-size: var(--size);
+    display: grid; place-items: center;
+  }
+
+  /* The arc lives on a pseudo-element so the mask does not eat the label. */
+  .ring::before {
+    content: "";
+    position: absolute; inset: 0;
+    border-radius: 50%;
+    background: conic-gradient(from -90deg,
+      var(--accent) calc(var(--ring-progress) * 360deg),
+      color-mix(in oklab, var(--hairline) 70%, transparent) 0);
+    mask: radial-gradient(closest-side, transparent 0 77%, #000 78%);
+    filter: drop-shadow(0 0 16px color-mix(in oklab, var(--accent) 40%, transparent));
+  }
+
+  .ring-inner { position: relative; display: grid; place-items: center; gap: 0.1rem; }
+  .ring-value {
+    font-size: clamp(1.6rem, 1.2rem + 1.6vw, 2.2rem);
+    font-weight: 600; letter-spacing: -0.04em;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+  .ring-unit { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.09em; color: var(--ink-3); }
+  .ring-caption { font-size: 0.76rem; color: var(--ink-3); }
+}
+
+@layer panels {
+  /* Panels are opaque rather than frosted: a backdrop-filter on every large
+     surface is what makes a page like this stutter while scrolling. */
+  .panel {
+    border-radius: var(--radius);
+    border: 1px solid var(--hairline-soft);
+    background: var(--surface-panel);
+    box-shadow: var(--shadow);
+    padding: var(--pad);
+    container-type: inline-size;
+  }
+
+  .panel-head {
+    display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between;
+    gap: 0.75rem 1rem;
+    margin-block-end: 1.1rem;
+
+    h2 { font-size: 1rem; letter-spacing: -0.01em; }
+  }
+  .panel-sub { font-size: 0.78rem; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
+  .stats {
+    display: grid;
+    gap: clamp(0.6rem, 1.4vw, 0.9rem);
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  }
+
+  .stat {
+    position: relative;
+    display: grid; gap: 0.15rem;
+    padding: 0.95rem 1rem 1rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--hairline-soft);
+    background: var(--surface-panel);
+    overflow: hidden;
+    transition: transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1), border-color 200ms;
+
+    &::before {
+      content: "";
+      position: absolute; inset-block: 0; inset-inline-start: 0;
+      inline-size: 2px;
+      background: var(--tone, var(--series-1));
+      opacity: 0.75;
+    }
+    &:hover { transform: translateY(-2px); border-color: var(--hairline); }
+    &[data-zero="true"]::before { opacity: 0.22; }
+  }
+  .stat-value {
+    font-size: clamp(1.6rem, 1.3rem + 1vw, 2rem);
+    font-weight: 600; letter-spacing: -0.04em; line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat[data-zero="true"] .stat-value { color: var(--ink-3); }
+  .stat-label { font-size: 0.74rem; color: var(--ink-3); }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+  .chip {
+    padding: 0.28rem 0.7rem;
+    font-size: 0.76rem; font-weight: 500;
+    color: var(--ink-3);
+    border: 1px solid var(--hairline-soft);
+    border-radius: 999px;
+    transition: color 160ms, background 160ms, border-color 160ms;
+
+    &:hover { color: var(--ink); }
+    &[aria-pressed="true"] {
+      color: var(--bg-deep);
+      background: var(--ink);
+      border-color: var(--ink);
+    }
+  }
+
+  .empty { padding: 2rem 0 1rem; text-align: center; color: var(--ink-3); font-size: 0.85rem; }
+}
+
+@layer chart {
+  .chart { display: grid; gap: 0.5rem; }
+
+  /* minmax(0, 1fr) rather than 1fr: with 24 columns, `1fr` floors each column
+     at the bar/label min-content width and pushes the page into horizontal
+     overflow on a phone. */
+  .chart-plot {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+    align-items: end;
+    gap: 2px;                 /* 2px surface gap between adjacent bars */
+    block-size: clamp(84px, 14vw, 132px);
+    padding-block-end: 1px;
+    border-block-end: 1px solid var(--hairline-soft);
+  }
+
+  .bar {
+    position: relative;
+    display: block;
+    inline-size: min(100%, 26px);
+    justify-self: center;
+    min-block-size: 2px;
+    block-size: calc(max(var(--bar-scale), 0.012) * 100%);
+    border-radius: 4px 4px 0 0;   /* rounded data-end, anchored to baseline */
+    background: var(--series-1);
+    transform-origin: bottom;
+    transition: filter 140ms ease;
+
+    &[data-zero="true"] { background: var(--hairline); opacity: 0.55; }
+    &:hover, &:focus-visible { filter: brightness(1.18) saturate(1.1); }
+    &[data-peak="true"]::after {
+      content: attr(data-count);
+      position: absolute; inset-block-end: calc(100% + 4px); inset-inline: 0;
+      text-align: center;
+      font-size: 0.68rem; font-variant-numeric: tabular-nums;
+      color: var(--ink-2);
+    }
+  }
+
+  .chart-axis {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+    gap: 2px;
+    font-size: 0.66rem;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+
+    /* Only every 6th label is shown, so a label may overflow its own narrow
+       column into the blank ones beside it. */
+    span { text-align: center; opacity: 0; white-space: nowrap; overflow: visible; }
+    span[data-tick="true"] { opacity: 1; }
+    span:last-child { text-align: end; }
+  }
+
+  .tooltip {
+    position: fixed;
+    z-index: 10;
+    padding: 0.45rem 0.65rem;
+    border-radius: 9px;
+    border: 1px solid var(--hairline);
+    background: var(--surface-2);
+    box-shadow: var(--shadow-lg);
+    font-size: 0.75rem;
+    line-height: 1.35;
+    pointer-events: none;
+    transform: translate(-50%, calc(-100% - 10px));
+    transition: opacity 120ms ease;
+
+    strong { display: block; font-variant-numeric: tabular-nums; }
+    span { color: var(--ink-3); }
+    &[hidden] { display: none; }
+  }
+}
+
+@layer feed {
+  .feed {
+    display: grid;
+    gap: 0;
+    margin-inline-start: 0.35rem;
+    border-inline-start: 1px solid var(--hairline-soft);
+  }
+
+  .row {
+    position: relative;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: baseline;
+    gap: 0.5rem 0.85rem;
+    padding: 0.62rem 0.5rem 0.62rem 1.15rem;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    transition: background 160ms ease;
+
+    &::before {
+      content: "";
+      position: absolute;
+      inset-inline-start: -4.5px;
+      inset-block-start: 1.05rem;
+      inline-size: 8px; block-size: 8px;
+      border-radius: 50%;
+      background: var(--tone);
+      box-shadow: 0 0 0 3px var(--bg-deep);
+    }
+    &:hover { background: color-mix(in oklab, var(--ink) 5%, transparent); }
+    &[hidden] { display: none; }
+  }
+
+  .row-icon {
+    display: grid; place-items: center;
+    inline-size: 26px; block-size: 26px;
+    border-radius: 8px;
+    color: var(--tone);
+    background: color-mix(in oklab, var(--tone) 14%, transparent);
+    align-self: center;
+
+    svg { inline-size: 14px; block-size: 14px; }
+  }
+
+  .row-main { display: grid; gap: 0.1rem; min-inline-size: 0; }
+  .row-label { font-size: 0.87rem; font-weight: 500; }
+  .row-sub {
+    font-size: 0.75rem; color: var(--ink-3);
+    display: flex; flex-wrap: wrap; gap: 0.15rem 0.5rem;
+
+    code { font-family: var(--mono); font-size: 0.72rem; letter-spacing: -0.01em; }
+    .row-steps { color: color-mix(in oklab, var(--ink-3) 72%, transparent); }
+  }
+  .row-time {
+    font-size: 0.73rem; color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    align-self: center;
+  }
+
+  @container (max-width: 34rem) {
+    .row { grid-template-columns: auto 1fr; }
+    .row-time { grid-column: 2; justify-self: start; }
+  }
+}
+
+@layer motion {
+  /* Rows fade in as they scroll into the panel — pure CSS, no observer. */
+  @supports (animation-timeline: view()) {
+    @media (prefers-reduced-motion: no-preference) {
+      .row {
+        animation: rise linear both;
+        animation-timeline: view();
+        animation-range: entry 0% entry 26%;
+      }
+    }
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .stat, .hero {
+      @starting-style { opacity: 0; transform: translateY(8px); }
+    }
+    .stat, .hero { transition-property: opacity, transform, border-color, background; }
+  }
+
+  ::view-transition-old(hero), ::view-transition-new(hero) {
+    animation-duration: 380ms;
+    animation-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+    .glow { animation: none; }
+  }
+}
