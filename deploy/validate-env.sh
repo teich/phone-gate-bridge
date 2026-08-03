@@ -38,6 +38,12 @@ if (( ${#missing[@]} > 0 )); then
   exit 1
 fi
 
+if [[ -n "${TWILIO_PHONE_NUMBER:-}" ]] &&
+  [[ ! "$TWILIO_PHONE_NUMBER" =~ ^[+][1-9][0-9]{1,14}$ ]]; then
+  echo "ERROR: TWILIO_PHONE_NUMBER must be an E.164 number such as +17075551111"
+  exit 1
+fi
+
 ALLOWED_CALLERS_FILE="${ALLOWED_CALLERS_FILE:-/etc/phone-gate-bridge/allowed-callers.toml}"
 if [[ ! -f "$ALLOWED_CALLERS_FILE" ]]; then
   echo "ERROR: allowed callers file not found: $ALLOWED_CALLERS_FILE"

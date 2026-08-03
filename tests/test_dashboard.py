@@ -399,6 +399,7 @@ class ContractAndAssetTests(unittest.TestCase):
             return build_dashboard_state(
                 store=store,
                 door_name="Gate",
+                phone_number="+17075551111",
                 gate=GateStatus(state="secured", position="closed", relay="locked"),
                 caller_names={"+17075551111": "Oren"},
                 recent_limit=50,
@@ -410,6 +411,7 @@ class ContractAndAssetTests(unittest.TestCase):
         self.assertEqual(payload["schema_version"], 1)
         self.assertEqual(payload["server_time"], NOW)
         self.assertEqual(payload["door"], "Gate")
+        self.assertEqual(payload["phone_number"], "+17075551111")
         self.assertEqual(payload["gate"]["position"], "closed")
         self.assertEqual(payload["gate"]["relay"], "locked")
         self.assertIsNone(payload["gate"]["active_hold"])

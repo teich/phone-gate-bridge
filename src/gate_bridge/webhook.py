@@ -5,6 +5,7 @@ import ipaddress
 import hashlib
 import hmac
 import os
+import re
 import threading
 import time
 import xml.sax.saxutils as saxutils
@@ -51,6 +52,7 @@ class WebhookConfig:
     bind_port: int = 8080
     allowed_callers_file: str = "/etc/phone-gate-bridge/allowed-callers.toml"
     twilio_auth_token: str = ""
+    twilio_phone_number: str = ""
     public_base_url: str = ""
     twilio_tts_voice: str = "Polly.Joanna-Neural"
     dashboard_allowed_cidrs: tuple[str, ...] = (
@@ -78,6 +80,18 @@ def normalize_phone(value: str) -> str:
     if value.startswith("+"):
         return "+" + "".join(ch for ch in value[1:] if ch.isdigit())
     return "".join(ch for ch in value if ch.isdigit())
+
+
+def parse_twilio_phone_number(value: str) -> str:
+    """Return a canonical E.164 number, or an empty string when not configured."""
+    value = value.strip()
+    if not value:
+        return ""
+    if not re.fullmatch(r"\+[1-9][0-9]{1,14}", value):
+        raise ValueError(
+            "TWILIO_PHONE_NUMBER must be an E.164 number such as +17075551111"
+        )
+    return value
 
 
 def load_allowed_callers(path: str) -> tuple[AllowedCaller, ...]:
@@ -282,6 +296,9 @@ def load_config_from_env() -> WebhookConfig:
     public_base_url = os.getenv("PUBLIC_BASE_URL")
     if not public_base_url:
         raise ValueError("PUBLIC_BASE_URL is required")
+    twilio_phone_number = parse_twilio_phone_number(
+        os.getenv("TWILIO_PHONE_NUMBER", "")
+    )
     dashboard_allowed_cidrs = os.getenv(
         "DASHBOARD_ALLOWED_CIDRS",
         "127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
@@ -316,6 +333,7 @@ def load_config_from_env() -> WebhookConfig:
         bind_port=int(os.getenv("WEBHOOK_BIND_PORT", "8080")),
         allowed_callers_file=allowed_callers_file,
         twilio_auth_token=twilio_auth_token,
+        twilio_phone_number=twilio_phone_number,
         public_base_url=public_base_url.rstrip("/"),
         twilio_tts_voice=os.getenv("TWILIO_TTS_VOICE", "Polly.Joanna-Neural"),
         dashboard_allowed_cidrs=tuple(
@@ -701,6 +719,7 @@ class TwilioWebhookHandler(BaseHTTPRequestHandler):
         return build_dashboard_state(
             store=self.activity,
             door_name=self.config.door_name,
+            phone_number=self.config.twilio_phone_number,
             gate=gate,
             caller_names=caller_names,
             recent_limit=self.config.dashboard_recent_events_limit,

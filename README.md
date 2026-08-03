@@ -178,6 +178,8 @@ Required values:
 - `UNIFI_ACCESS_API_TOKEN`
 - `PUBLIC_BASE_URL` (example: `https://gate.teich.network`)
 - `TWILIO_AUTH_TOKEN` (from Twilio Console)
+- `TWILIO_PHONE_NUMBER` (optional; the inbound number in E.164 form, such as
+  `+17075551111`, exposed to the LAN-only dashboard as `phone_number`)
 - `TWILIO_TTS_VOICE` (optional, default: `Polly.Joanna-Neural`)
 - `ALLOWED_CALLERS_FILE` (example: `/etc/phone-gate-bridge/allowed-callers.toml`)
 - `DASHBOARD_ALLOWED_CIDRS` (optional, default: `127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`)
@@ -186,6 +188,16 @@ Required values:
   `/var/lib/phone-gate-bridge/activity.sqlite3`, while an existing
   `var/activity.sqlite3` is reused automatically)
 - `MAX_WEBHOOK_BODY_BYTES` (optional, default: `16384`)
+
+For the existing systemd installation, edit the runtime environment directly;
+there is no `/opt/phone-gate-bridge/.env` to sync:
+
+```bash
+sudoedit /etc/phone-gate-bridge/phone-gate-bridge.env
+# Add: TWILIO_PHONE_NUMBER=+17075551111
+sudo /opt/phone-gate-bridge/deploy/validate-env.sh /etc/phone-gate-bridge/phone-gate-bridge.env
+sudo /opt/phone-gate-bridge/deploy/deploy-phone-gate.sh
+```
 
 Caller allowlist file:
 

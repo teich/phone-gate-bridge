@@ -1,10 +1,12 @@
 import http.client
 import json
+import subprocess
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 from gate_bridge.activity import ActivityStore
@@ -18,7 +20,9 @@ from gate_bridge.webhook import (
     is_ip_allowed,
     is_valid_twilio_signature,
     load_allowed_callers,
+    load_config_from_env,
     normalize_phone,
+    parse_twilio_phone_number,
     parse_cidr_list,
     resolve_dashboard_db_path,
     twiml_gather,
@@ -30,6 +34,84 @@ class WebhookHelpersTests(unittest.TestCase):
     def test_normalize_phone(self):
         self.assertEqual(normalize_phone("+1 (707) 555-1111"), "+17075551111")
         self.assertEqual(normalize_phone("707-555-1111"), "7075551111")
+
+    def test_twilio_phone_number_is_validated_as_e164(self):
+        self.assertEqual(parse_twilio_phone_number(""), "")
+        self.assertEqual(
+            parse_twilio_phone_number("+17075551111"),
+            "+17075551111",
+        )
+        with self.assertRaisesRegex(ValueError, "E.164"):
+            parse_twilio_phone_number("707-555-1111")
+
+    def test_config_loads_the_optional_twilio_phone_number(self):
+        with TemporaryDirectory() as tmp:
+            callers_path = Path(tmp) / "allowed-callers.toml"
+            callers_path.write_text(
+                "\n".join(
+                    [
+                        "[[callers]]",
+                        'number = "+17075551111"',
+                        "enabled = true",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                "UNIFI_HOST": "192.168.2.1",
+                "UNIFI_ACCESS_API_TOKEN": "access-token",
+                "TWILIO_AUTH_TOKEN": "twilio-token",
+                "TWILIO_PHONE_NUMBER": "+17075551111",
+                "PUBLIC_BASE_URL": "https://gate.example.test",
+                "ALLOWED_CALLERS_FILE": str(callers_path),
+            }
+            with patch.dict("os.environ", env, clear=True):
+                config = load_config_from_env()
+            self.assertEqual(config.twilio_phone_number, "+17075551111")
+
+            del env["TWILIO_PHONE_NUMBER"]
+            with patch.dict("os.environ", env, clear=True):
+                config_without_number = load_config_from_env()
+            self.assertEqual(config_without_number.twilio_phone_number, "")
+
+    def test_deploy_validation_checks_optional_twilio_phone_number(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            callers_path = root / "allowed-callers.toml"
+            callers_path.write_text(
+                '[[callers]]\nnumber = "+17075551111"\nenabled = true\n',
+                encoding="utf-8",
+            )
+            env_path = root / "phone-gate-bridge.env"
+            base_env = "\n".join(
+                [
+                    "UNIFI_HOST=192.168.2.1",
+                    "UNIFI_ACCESS_API_TOKEN=access-token",
+                    "PUBLIC_BASE_URL=https://gate.example.test",
+                    "TWILIO_AUTH_TOKEN=twilio-token",
+                    f'ALLOWED_CALLERS_FILE="{callers_path}"',
+                ]
+            )
+            script = Path(__file__).resolve().parents[1] / "deploy" / "validate-env.sh"
+
+            for value, expected_status in (
+                ("", 0),
+                ("+17075551111", 0),
+                ("707-555-1111", 1),
+            ):
+                phone_line = f"\nTWILIO_PHONE_NUMBER={value}" if value else ""
+                env_path.write_text(base_env + phone_line + "\n", encoding="utf-8")
+                result = subprocess.run(
+                    ["bash", str(script), str(env_path)],
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    expected_status,
+                    msg=result.stdout + result.stderr,
+                )
 
     def test_allowed_caller_true(self):
         allowed = (
@@ -209,6 +291,7 @@ class HandlerIntegrationTests(unittest.TestCase):
             token="token",
             allowed_callers_file=str(callers_path),
             twilio_auth_token="twilio-secret",
+            twilio_phone_number="+17075551111",
             public_base_url="https://gate.example.test",
             dashboard_db_path=str(root / "activity.sqlite3"),
             max_webhook_body_bytes=128,
@@ -279,7 +362,9 @@ class HandlerIntegrationTests(unittest.TestCase):
         self.assertIn("frame-ancestors 'none'", page_headers["Content-Security-Policy"])
         self.assertEqual(state_status, 200)
         self.assertEqual(state_headers["Cache-Control"], "no-store")
-        self.assertEqual(json.loads(raw_state)["schema_version"], 1)
+        state = json.loads(raw_state)
+        self.assertEqual(state["schema_version"], 1)
+        self.assertEqual(state["phone_number"], "+17075551111")
 
         counts, _ = self.store.snapshot(20)
         self.assertEqual(counts["dashboard_view"], 1)

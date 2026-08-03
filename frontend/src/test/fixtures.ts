@@ -26,6 +26,7 @@ export function dashboardState(): DashboardState {
     server_time: 1_700_000_000,
     revision: 3,
     door: "Gate",
+    phone_number: "+17075551234",
     gate: {
       state: "secured",
       position: "closed",

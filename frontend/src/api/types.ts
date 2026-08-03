@@ -74,6 +74,7 @@ export interface DashboardState {
   server_time: number;
   revision: number;
   door: string;
+  phone_number: string;
   gate: GateStatus;
   last_open: LastOpen | null;
   stats: DashboardStat[];
@@ -108,7 +109,10 @@ export function parseDashboardState(value: unknown): DashboardState {
   ) {
     throw new Error("Dashboard response does not match schema version 1");
   }
-  return value as unknown as DashboardState;
+  return {
+    ...value,
+    phone_number: typeof value.phone_number === "string" ? value.phone_number : "",
+  } as unknown as DashboardState;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

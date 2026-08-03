@@ -5,6 +5,7 @@ import { ActivityChart } from "./components/ActivityChart";
 import { ActivityPanel } from "./components/ActivityPanel";
 import { GateHero } from "./components/GateHero";
 import { Header } from "./components/Header";
+import { PhoneNumberCard } from "./components/PhoneNumberCard";
 import { StatGrid } from "./components/StatGrid";
 import { timestampFormatter } from "./format";
 import { useTheme } from "./hooks/useTheme";
@@ -31,12 +32,15 @@ export default function App() {
       {dashboard === null ? (
         <InitialState error={error} onRetry={refresh} />
       ) : (
-        <main>
-          <GateHero gate={dashboard.gate} lastOpen={dashboard.last_open} />
-          <StatGrid stats={dashboard.stats} />
-          <ActivityChart chart={dashboard.chart} />
-          <ActivityPanel events={dashboard.events} />
-        </main>
+        <>
+          <PhoneNumberCard phoneNumber={dashboard.phone_number} />
+          <main>
+            <GateHero gate={dashboard.gate} lastOpen={dashboard.last_open} />
+            <StatGrid stats={dashboard.stats} />
+            <ActivityChart chart={dashboard.chart} />
+            <ActivityPanel events={dashboard.events} />
+          </main>
+        </>
       )}
       <footer className="foot">
         <span>Read-only · local networks only</span>

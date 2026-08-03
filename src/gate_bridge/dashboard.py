@@ -91,6 +91,7 @@ class GateStatus:
 class DashboardState:
     door_name: str
     gate: GateStatus
+    phone_number: str = ""
     revision: int = 0
     stats: list[dict[str, Any]] = field(default_factory=list)
     chart: dict[str, Any] = field(default_factory=dict)
@@ -104,6 +105,7 @@ class DashboardState:
             "server_time": self.generated_at,
             "revision": self.revision,
             "door": self.door_name,
+            "phone_number": self.phone_number,
             "gate": self.gate.to_json(),
             "last_open": self.last_open,
             "stats": self.stats,
@@ -288,6 +290,7 @@ def build_dashboard_state(
     gate: GateStatus,
     caller_names: dict[str, str],
     recent_limit: int,
+    phone_number: str = "",
     now: float | None = None,
 ) -> DashboardState:
     now = time.time() if now is None else now
@@ -335,6 +338,7 @@ def build_dashboard_state(
     return DashboardState(
         door_name=door_name,
         gate=gate,
+        phone_number=phone_number,
         revision=store.latest_id(),
         stats=stats,
         chart={

@@ -190,6 +190,120 @@
     padding-inline: 0.25rem;
   }
 
+  .phone-card {
+    position: relative;
+    width: min(1180px, 100%);
+    margin-inline: auto;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.8rem 1rem;
+    padding: clamp(1rem, 0.8rem + 1vw, 1.35rem);
+    border: 1px solid var(--hairline-soft);
+    border-radius: var(--radius);
+    background:
+      linear-gradient(120deg, color-mix(in oklab, var(--accent) 12%, transparent), transparent 48%),
+      var(--surface-panel);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+
+  .phone-card::before {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    inline-size: 3px;
+    background: var(--accent);
+  }
+
+  .phone-card-icon {
+    display: grid;
+    place-items: center;
+    inline-size: 44px;
+    block-size: 44px;
+    border-radius: 13px;
+    color: var(--accent);
+    background: color-mix(in oklab, var(--accent) 14%, transparent);
+
+    svg { inline-size: 21px; block-size: 21px; }
+  }
+
+  .phone-card-body { min-inline-size: 0; }
+  .phone-card-label {
+    color: var(--ink-3);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .phone-card-number {
+    display: inline-block;
+    color: var(--ink);
+    font-size: clamp(1.55rem, 1.2rem + 1.8vw, 2.25rem);
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.035em;
+    line-height: 1.15;
+    text-decoration-color: color-mix(in oklab, var(--accent) 50%, transparent);
+    text-decoration-thickness: 1px;
+    text-underline-offset: 0.18em;
+    user-select: all;
+    -webkit-touch-callout: default;
+
+    &:hover { text-decoration-color: var(--accent); }
+  }
+  .phone-card-hint {
+    margin-block-start: 0.2rem;
+    color: var(--ink-3);
+    font-size: 0.76rem;
+  }
+
+  .phone-copy-button {
+    min-block-size: 44px;
+    padding-inline: 1rem;
+    border: 1px solid var(--hairline);
+    border-radius: 11px;
+    color: var(--ink);
+    background: var(--surface-2);
+    font-size: 0.8rem;
+    font-weight: 600;
+    white-space: nowrap;
+    transition: color 160ms, border-color 160ms, background 160ms, transform 160ms;
+
+    &:hover { border-color: var(--accent); transform: translateY(-1px); }
+    &[data-status="copied"] {
+      color: var(--bg-deep);
+      border-color: var(--good);
+      background: var(--good);
+    }
+    &[data-status="error"] {
+      color: var(--critical);
+      border-color: var(--critical);
+    }
+  }
+
+  .phone-copy-fallback {
+    position: fixed;
+    inset-block-start: -100px;
+    inset-inline-start: -100px;
+    inline-size: 1px;
+    block-size: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  @media (max-width: 36rem) {
+    .phone-card {
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: start;
+    }
+    .phone-copy-button {
+      grid-column: 1 / -1;
+      inline-size: 100%;
+    }
+  }
+
   .brand { display: flex; align-items: center; gap: 0.7rem; }
 
   .brand-mark {
